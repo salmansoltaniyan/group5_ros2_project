@@ -7,6 +7,11 @@ from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import Twist
 from irobot_create_msgs.msg import IrIntensityVector, HazardDetectionVector, HazardDetection
 
+TARGET_LEFT = 400
+LOST_LEFT = 50
+FRONT_BLOCKED = 400
+SPEED = 0.15
+KP = 0.002
 
 class WallFollower(Node):
 
@@ -35,14 +40,14 @@ class WallFollower(Node):
             cmd.linear.x = -0.1
         elif since_bump < 1.3:
             cmd.angular.z = -1.0
-        elif front > 400:
+        elif front > FRONT_BLOCKED:
             cmd.angular.z = -0.8
-        elif left < 50:
+        elif left < LOST_LEFT:
             cmd.linear.x = 0.1
             cmd.angular.z = 0.6
         else:
-            cmd.linear.x = 0.15
-            cmd.angular.z = max(-1.0, min(1.0, 0.002 * (400 - left)))
+            cmd.linear.x = SPEED
+            cmd.angular.z = max(-1.0, min(1.0, KP * (TARGET_LEFT - left)))
 
         self.pub.publish(cmd)
 
