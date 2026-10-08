@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'wall_following = create3_pkg.wall_following:main'
         ],
     },
 )
