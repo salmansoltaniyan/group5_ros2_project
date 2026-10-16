@@ -37,7 +37,11 @@ def generate_launch_description():
     hit_y_arg = DeclareLaunchArgument('hit_y', default_value='0.4', description='Hit point Y')
     follow_side_arg = DeclareLaunchArgument('follow_side', default_value='-1', description='Follow side: -1 Right, +1 Left')
 
-    line_tol_arg = DeclareLaunchArgument('line_tolerance', default_value='0.08', description='M-line tolerance (m)')
+    auto_detect_arg = DeclareLaunchArgument('auto_detect_start', default_value='true', description='Auto-detect Start/Hit from live odometry')
+    target_dist_arg = DeclareLaunchArgument('target_distance', default_value='2.0', description='Target distance ahead along heading (m)')
+    start_behind_arg = DeclareLaunchArgument('start_behind_dist', default_value='0.5', description='Start M distance behind Hit along heading (m)')
+
+    line_tol_arg = DeclareLaunchArgument('line_tolerance', default_value='0.10', description='M-line tolerance (m)')
     dep_thresh_arg = DeclareLaunchArgument('hit_departure_threshold', default_value='0.25', description='Hit departure (m)')
     prog_margin_arg = DeclareLaunchArgument('progress_margin', default_value='0.05', description='Progress margin (m)')
 
@@ -77,6 +81,10 @@ def generate_launch_description():
         emulate_tty=True,
         parameters=[{
             'action_name': 'bug2_wall_follow', # Expands to /<namespace>/bug2_wall_follow
+            'odom_topic': '/robot_9/odom',
+            'auto_detect_start': LaunchConfiguration('auto_detect_start'),
+            'target_distance': LaunchConfiguration('target_distance'),
+            'start_behind_dist': LaunchConfiguration('start_behind_dist'),
             'start_x': LaunchConfiguration('start_x'),
             'start_y': LaunchConfiguration('start_y'),
             'target_x': LaunchConfiguration('target_x'),
@@ -89,6 +97,9 @@ def generate_launch_description():
 
     return LaunchDescription([
         namespace_arg,
+        auto_detect_arg,
+        target_dist_arg,
+        start_behind_arg,
         start_x_arg,
         start_y_arg,
         target_x_arg,

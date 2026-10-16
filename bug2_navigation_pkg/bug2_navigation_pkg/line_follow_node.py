@@ -19,10 +19,13 @@ Role in Bug 2 Architecture:
 ===============================================================================
 """
 
+import math
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import Point
+from nav_msgs.msg import Odometry
 from create3_interfaces.action import Bug2WallFollow
 
 
@@ -31,45 +34,118 @@ class LineFollowNode(Node):
         super().__init__('line_follow_node')
 
         # ---------------------------------------------------------------------
-        # 1. PARAMETERS (Example coordinates for demonstration)
+        # 1. PARAMETERS
         # ---------------------------------------------------------------------
-        # NOTE: In a full integration, these coordinates are dynamically provided
-        # by the line follower / obstacle detector when an obstacle is encountered.
         self.declare_parameter('action_name', '/robot_9/bug2_wall_follow')
-        self.declare_parameter('start_x', 0.0)      # Example Start Point M (x)
-        self.declare_parameter('start_y', 0.0)      # Example Start Point M (y)
-        self.declare_parameter('target_x', 2.0)     # Example Target Point G (x)
-        self.declare_parameter('target_y', 1.0)     # Example Target Point G (y)
-        self.declare_parameter('hit_x', 0.8)        # Example Hit Point H (x)
-        self.declare_parameter('hit_y', 0.4)        # Example Hit Point H (y)
-        self.declare_parameter('follow_side', -1)   # -1: Right wall, +1: Left wall
+        self.declare_parameter('odom_topic', '/robot_9/odom')
+        self.declare_parameter('auto_detect_start', True)   # Auto-detect pose from odometry
+        self.declare_parameter('target_distance', 2.0)      # Distance (m) ahead along heading
+        self.declare_parameter('start_behind_dist', 0.5)    # Distance (m) behind hit point for M
+        self.declare_parameter('follow_side', -1)           # -1: Right wall, +1: Left wall
+
+        # Manual coordinates (used when auto_detect_start is False)
+        self.declare_parameter('start_x', 0.0)
+        self.declare_parameter('start_y', 0.0)
+        self.declare_parameter('target_x', 2.0)
+        self.declare_parameter('target_y', 1.0)
+        self.declare_parameter('hit_x', 0.8)
+        self.declare_parameter('hit_y', 0.4)
 
         self.action_name = str(self.get_parameter('action_name').value)
+        self.odom_topic = str(self.get_parameter('odom_topic').value)
+        self.auto_detect_start = bool(self.get_parameter('auto_detect_start').value)
+        self.target_distance = float(self.get_parameter('target_distance').value)
+        self.start_behind_dist = float(self.get_parameter('start_behind_dist').value)
+        self.follow_side = int(self.get_parameter('follow_side').value)
+
         self.start_x = float(self.get_parameter('start_x').value)
         self.start_y = float(self.get_parameter('start_y').value)
         self.target_x = float(self.get_parameter('target_x').value)
         self.target_y = float(self.get_parameter('target_y').value)
         self.hit_x = float(self.get_parameter('hit_x').value)
         self.hit_y = float(self.get_parameter('hit_y').value)
-        self.follow_side = int(self.get_parameter('follow_side').value)
 
         # ---------------------------------------------------------------------
         # 2. ACTION CLIENT SETUP
         # ---------------------------------------------------------------------
         self._action_client = ActionClient(self, Bug2WallFollow, self.action_name)
         self._goal_handle = None
+        self._goal_sent = False
+
+        if self.auto_detect_start:
+            self.get_logger().info('=' * 70)
+            self.get_logger().info('🤖 [LineFollowNode] Initialized with AUTO-ODOMETRY MODE!')
+            self.get_logger().info(f'   Target Action Server: {self.action_name}')
+            self.get_logger().info(f'   Target Distance:      {self.target_distance:.2f} m ahead along heading')
+            self.get_logger().info(f'   Follow Side:          {"LEFT" if self.follow_side == 1 else "RIGHT"}')
+            self.get_logger().info(f'   Listening to:         {self.odom_topic}')
+            self.get_logger().info('=' * 70)
+
+            sensor_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+            self._odom_sub = self.create_subscription(
+                Odometry,
+                self.odom_topic,
+                self._odom_callback,
+                sensor_qos
+            )
+            # Backup subscriber if namespace is omitted
+            if self.odom_topic.startswith('/robot_9'):
+                self._odom_sub_backup = self.create_subscription(
+                    Odometry,
+                    '/odom',
+                    self._odom_callback,
+                    sensor_qos
+                )
+        else:
+            self.get_logger().info('=' * 70)
+            self.get_logger().info('🤖 [LineFollowNode] Initialized with MANUAL coordinates!')
+            self.get_logger().info(f'   Target Action Server: {self.action_name}')
+            self.get_logger().info(f'   Start Point (M):      ({self.start_x:.2f}, {self.start_y:.2f})')
+            self.get_logger().info(f'   Target Point (G):     ({self.target_x:.2f}, {self.target_y:.2f})')
+            self.get_logger().info(f'   Hit Point (H):        ({self.hit_x:.2f}, {self.hit_y:.2f})')
+            self.get_logger().info(f'   Follow Side:          {"LEFT" if self.follow_side == 1 else "RIGHT"}')
+            self.get_logger().info('=' * 70)
+            self._timer = self.create_timer(1.0, self.send_goal_once)
+
+    def _odom_callback(self, msg: Odometry):
+        """Automatically reads the current robot pose from odometry and sets Bug2 points."""
+        if self._goal_sent:
+            return
+        self._goal_sent = True
+
+        curr_x = msg.pose.pose.position.x
+        curr_y = msg.pose.pose.position.y
+
+        # Compute yaw angle from quaternion
+        q = msg.pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+        yaw_deg = math.degrees(yaw)
+
+        # Hit point H is current robot position at obstacle
+        self.hit_x = curr_x
+        self.hit_y = curr_y
+
+        # Target point G is target_distance ahead along robot heading
+        self.target_x = curr_x + self.target_distance * math.cos(yaw)
+        self.target_y = curr_y + self.target_distance * math.sin(yaw)
+
+        # Start point M is start_behind_dist behind Hit point along the line
+        self.start_x = curr_x - self.start_behind_dist * math.cos(yaw)
+        self.start_y = curr_y - self.start_behind_dist * math.sin(yaw)
 
         self.get_logger().info('=' * 70)
-        self.get_logger().info('🤖 [LineFollowNode] Initialized!')
-        self.get_logger().info(f'   Target Action Server: {self.action_name}')
-        self.get_logger().info(f'   Start Point (M):      ({self.start_x:.2f}, {self.start_y:.2f})')
-        self.get_logger().info(f'   Target Point (G):     ({self.target_x:.2f}, {self.target_y:.2f})')
-        self.get_logger().info(f'   Hit Point (H):        ({self.hit_x:.2f}, {self.hit_y:.2f})')
+        self.get_logger().info('🎯 [LineFollowNode] Auto-detected Live Odometry Pose!')
+        self.get_logger().info(f'   Robot Pose:           (x={curr_x:.2f}, y={curr_y:.2f}, heading={yaw_deg:.1f}°)')
+        self.get_logger().info(f'   Start Point (M):      ({self.start_x:.2f}, {self.start_y:.2f}) [{self.start_behind_dist:.1f}m behind Hit]')
+        self.get_logger().info(f'   Hit Point (H):        ({self.hit_x:.2f}, {self.hit_y:.2f}) [Current Robot Position]')
+        self.get_logger().info(f'   Target Point (G):     ({self.target_x:.2f}, {self.target_y:.2f}) [{self.target_distance:.1f}m ahead along heading]')
         self.get_logger().info(f'   Follow Side:          {"LEFT" if self.follow_side == 1 else "RIGHT"}')
         self.get_logger().info('=' * 70)
 
-        # Start goal submission after a brief timer to allow action server discovery
-        self._timer = self.create_timer(1.0, self.send_goal_once)
+        # Send the goal
+        self.send_wall_follow_goal()
 
     def send_goal_once(self):
         """Timer callback that triggers goal submission once."""
