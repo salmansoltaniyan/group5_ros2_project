@@ -56,15 +56,24 @@ class SimpleWallFollower(Node):
         self.FRONT_CLEAR_DIST = self.ROBOT_FRONT_OFFSET + 0.18                  # = 0.38m to resume
 
         # Early Corner detection threshold:
-        # Detects the corner opening early (0.32m = 14 cm air gap)
+        # Detects the corner opening early (0.33m = 15 cm air gap)
         # so the robot begins wrapping around the corner immediately!
-        self.WALL_LOST_DIST = 0.32       # 0.32m from LiDAR
+        self.WALL_LOST_DIST = 0.33       # 0.33m from LiDAR
 
         # ---------------------------------------------------------------------
-        # 3. SPEEDS & CONTROLLER GAINS (Stanley Wall Following - Smoothed)
+        # 3. SPEEDS & CONTROLLER GAINS
         # ---------------------------------------------------------------------
         self.FORWARD_SPEED = 0.12        # Cruise speed (m/s) - stable cruising
         self.TURN_SPEED = 0.60           # In-place pivot turn speed (rad/s)
+
+        # Outer Corner Trajectory:
+        # Constant radius arc R = v / |w| = 0.10 / 0.48 ≈ 0.21m (21 cm)
+        # Keeps chassis edge exactly 21cm - 18cm = 3-4 cm from corner vertex!
+        # Both wheels move forward (vL=0.15, vR=0.05 m/s); no wheel drag, no spinning in place.
+        self.CORNER_SPEED = 0.10         # Forward speed during outer corner (m/s)
+        self.CORNER_TURN_RATE = -0.48    # Clockwise yaw rate during outer corner (rad/s)
+        self.CORNER_MIN_TIME = 1.0       # Minimum turn duration before checking wall acquisition (s)
+        self.CORNER_TIMEOUT = 4.0        # Max duration before fallback seek (s)
 
         # Stanley Controller Gains (Smooth & Non-Oscillating):
         self.KP_DIST = 0.75              # Cross-track error gain (1cm error -> ~3.3° heading)
@@ -113,6 +122,9 @@ class SimpleWallFollower(Node):
             self.state = new_state
             self.state_start_time = self.get_clock().now()
             self.prev_wz = 0.0
+            # Reset EMA distance filters on state change so new wall is captured instantly
+            self.filt_dist_right = None
+            self.filt_dist_front_right = None
 
     def get_state_elapsed(self) -> float:
         return (self.get_clock().now() - self.state_start_time).nanoseconds / 1e9
@@ -212,35 +224,39 @@ class SimpleWallFollower(Node):
                 self.set_state(self.STATE_FOLLOW_WALL)
 
         # =====================================================================
-        # STATE 2: OUTER CORNER (Right wall ended -> Tight corner-hugging turn)
+        # STATE 2: OUTER CORNER (Right wall ended -> Tight 21cm corner arc)
         # =====================================================================
         elif self.state == self.STATE_OUTER_CORNER:
-            action_name = "HUGGING OUTER CORNER"
+            action_name = "OUTER CORNER (Tight 21cm Arc)"
 
-            # Tight wrapping turn: DO NOT drive forward across the hallway!
-            # Use small forward speed (0.05 m/s) with strong right rotation (-0.65 rad/s)
-            # Turning radius R = v / w = 0.05 / 0.65 ≈ 7.7 cm!
-            # The robot wraps tightly around the corner pivot and never reaches the opposite wall.
-            if self.dist_front < self.FRONT_STOP_DIST:
+            # Front bumper clearance guard:
+            # Only stop forward movement if bumper is within 6 cm of an obstacle
+            if self.dist_front < (self.ROBOT_FRONT_OFFSET + 0.06):
                 cmd.linear.x = 0.0
                 cmd.angular.z = -self.TURN_SPEED
             else:
-                cmd.linear.x = 0.05   # 5 cm/s
-                cmd.angular.z = -0.65 # Fast, tight right turn around corner
+                # Precise 21 cm circular arc around corner vertex
+                # Radius R = 0.10 / 0.48 ≈ 0.21m -> exactly 3-4 cm chassis gap!
+                cmd.linear.x = self.CORNER_SPEED
+                cmd.angular.z = self.CORNER_TURN_RATE
 
-            # Exit condition: As soon as the new wall is captured on the right side
-            if elapsed > 0.4 and self.dist_right < (self.TARGET_WALL_DIST + 0.08) and self.dist_front > self.FRONT_STOP_DIST:
-                self.set_state(self.STATE_FOLLOW_WALL)
+            # Exit condition: Check if new wall or 11cm face is acquired on right side
+            if elapsed > self.CORNER_MIN_TIME:
+                wall_captured = self.dist_right < (self.TARGET_WALL_DIST + 0.06)
+                wall_aligned = (self.dist_right < 0.32 and self.dist_front_right < 0.36)
 
-            # If after 2.0s no wall is found, stop turning and seek wall forward
-            elif elapsed > 2.0:
+                if (wall_captured or wall_aligned) and self.dist_front > self.FRONT_STOP_DIST:
+                    self.set_state(self.STATE_FOLLOW_WALL)
+
+            # Timeout fallback: After 4.0s (full ~110° turn), curve gently to find wall
+            elif elapsed > self.CORNER_TIMEOUT:
                 self.set_state(self.STATE_FIND_WALL)
 
         # =====================================================================
         # STATE 3: FIND WALL (Seek wall in open space)
         # =====================================================================
         elif self.state == self.STATE_FIND_WALL:
-            action_name = "SEEKING WALL (Straight Ahead)"
+            action_name = "SEEKING WALL (Right Curve)"
 
             # If front obstacle detected, turn left so it becomes the right wall!
             if self.dist_front < self.FRONT_STOP_DIST:
@@ -249,8 +265,8 @@ class SimpleWallFollower(Node):
             elif self.dist_right < (self.TARGET_WALL_DIST + 0.08):
                 self.set_state(self.STATE_FOLLOW_WALL)
             else:
-                cmd.linear.x = self.FORWARD_SPEED
-                cmd.angular.z = -0.10  # Gentle curve towards right
+                cmd.linear.x = 0.08
+                cmd.angular.z = -0.22  # Curve right towards expected wall, never drive straight!
 
         # =====================================================================
         # STATE 4: FOLLOW WALL (Stanley Cross-Track & Heading Controller)
@@ -263,12 +279,12 @@ class SimpleWallFollower(Node):
                 cmd.angular.z = self.TURN_SPEED
                 action_name = "OBSTACLE IN FRONT -> Turn Left"
 
-            # 2. Outer Corner: Right wall dropped off (> 0.32m)
+            # 2. Outer Corner: Right wall dropped off (> 0.33m)
             elif self.dist_right > self.WALL_LOST_DIST and self.dist_front_right > self.WALL_LOST_DIST:
                 self.set_state(self.STATE_OUTER_CORNER)
-                cmd.linear.x = 0.05
-                cmd.angular.z = -0.65
-                action_name = "OUTER CORNER -> Turning Right"
+                cmd.linear.x = self.CORNER_SPEED
+                cmd.angular.z = self.CORNER_TURN_RATE
+                action_name = "OUTER CORNER -> Starting 21cm Arc"
 
             # 3. Stanley Controller: Maintains CONSTANT 4 cm Distance (Smooth & Stable)
             else:
