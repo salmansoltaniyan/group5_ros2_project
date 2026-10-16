@@ -61,15 +61,15 @@ class SimpleWallFollower(Node):
         self.FRONT_CLEAR_DIST = self.ROBOT_FRONT_OFFSET + 0.20                  # = 0.40m to resume
 
         # Wall Lost threshold (Corner detection):
-        # Must be genuinely far (> 42 cm from LiDAR / 24 cm air gap) to trigger corner turn!
-        # This completely prevents false corner triggers while following wall.
-        self.WALL_LOST_DIST = 0.42       # 0.42m from LiDAR
+        # 0.34m from LiDAR (16 cm air gap). Detects the corner opening early
+        # so the robot begins wrapping around the corner immediately without overshooting forward!
+        self.WALL_LOST_DIST = 0.34       # 0.34m from LiDAR
 
         # ---------------------------------------------------------------------
         # 3. SPEEDS & CONTROLLER GAINS
         # ---------------------------------------------------------------------
-        self.FORWARD_SPEED = 0.14        # Cruise speed (m/s)
-        self.TURN_SPEED = 0.50           # In-place pivot turn speed (rad/s)
+        self.FORWARD_SPEED = 0.13        # Cruise speed (m/s)
+        self.TURN_SPEED = 0.60           # In-place pivot turn speed (rad/s)
         self.KP = 2.2                    # Distance error gain
         self.KD = 1.8                    # Heading alignment damping gain
 
@@ -188,33 +188,27 @@ class SimpleWallFollower(Node):
                 self.set_state(self.STATE_FOLLOW_WALL)
 
         # =====================================================================
-        # STATE 2: OUTER CORNER (Right wall ended -> Round the corner)
+        # STATE 2: OUTER CORNER (Right wall ended -> Tight corner-hugging turn)
         # =====================================================================
         elif self.state == self.STATE_OUTER_CORNER:
-            action_name = "ROUNDING OUTER CORNER"
+            action_name = "HUGGING OUTER CORNER"
 
-            # Phase A: First 0.8s, creep straight forward to clear rear wheels past lip
-            if elapsed < 0.8:
-                if self.dist_front < self.FRONT_STOP_DIST:
-                    # Front wall near, pivot in place immediately
-                    cmd.linear.x = 0.0
-                    cmd.angular.z = -self.TURN_SPEED
-                else:
-                    cmd.linear.x = 0.09
-                    cmd.angular.z = 0.0
-
-            # Phase B: 0.8s to 2.2s, pivot right in place around corner
-            elif elapsed <= 2.2:
+            # Tight wrapping turn: DO NOT drive forward across the hallway!
+            # Use tiny forward creep (0.02 m/s) with strong right rotation (-0.65 rad/s)
+            # so the robot wraps tightly around the corner pivot and never reaches the opposite wall.
+            if self.dist_front < self.FRONT_STOP_DIST:
                 cmd.linear.x = 0.0
                 cmd.angular.z = -self.TURN_SPEED
-
-                # Exit as soon as new wall is acquired on the right
-                if self.dist_right < (self.TARGET_WALL_DIST + 0.10) and self.dist_front > self.FRONT_STOP_DIST:
-                    self.set_state(self.STATE_FOLLOW_WALL)
-
-            # Phase C: If after 2.2s no wall is found, STOP turning right!
-            # Drive straight forward to find next wall (prevents spinning in circles!)
             else:
+                cmd.linear.x = 0.02   # 2 cm/s (almost zero forward displacement)
+                cmd.angular.z = -0.65 # Fast, tight right turn around corner
+
+            # Exit as soon as the new wall is captured on the right
+            if elapsed > 0.3 and self.dist_right < (self.TARGET_WALL_DIST + 0.08) and self.dist_front > self.FRONT_STOP_DIST:
+                self.set_state(self.STATE_FOLLOW_WALL)
+
+            # If after 2.0s no wall is found, stop turning and seek wall forward
+            elif elapsed > 2.0:
                 self.set_state(self.STATE_FIND_WALL)
 
         # =====================================================================
@@ -244,12 +238,12 @@ class SimpleWallFollower(Node):
                 cmd.angular.z = self.TURN_SPEED
                 action_name = "OBSTACLE IN FRONT -> Turn Left"
 
-            # 2. Real Outer Corner: Right wall genuinely dropped off (> 0.42m)
+            # 2. Outer Corner: Right wall dropped off (> 0.34m)
             elif self.dist_right > self.WALL_LOST_DIST and self.dist_front_right > self.WALL_LOST_DIST:
                 self.set_state(self.STATE_OUTER_CORNER)
-                cmd.linear.x = 0.09
-                cmd.angular.z = 0.0
-                action_name = "OUTER CORNER -> Clearing Lip"
+                cmd.linear.x = 0.02
+                cmd.angular.z = -0.65
+                action_name = "OUTER CORNER -> Turning Right"
 
             # 3. Standard Wall Following with Smooth PD Control
             else:
