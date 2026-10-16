@@ -1,25 +1,20 @@
 #!/usr/bin/env python3
 """
 ===============================================================================
-Robust & Stable LiDAR Wall Follower (Right-Hand Rule)
+High-Precision Wall Follower with Stanley Controller & Tight Corner Hugging
 ===============================================================================
-A rock-solid reactive controller designed to eliminate spinning, confusion,
-and corner-cutting in narrow corridors (~0.50m):
-
-1. Clean 4-State Machine:
-   - FOLLOW_WALL   : Smooth PD wall hugging at 5 cm gap (0.23m from LiDAR).
-   - PIVOT_INNER   : Wall ahead -> Stops forward motion and pivots left in place.
-   - OUTER_CORNER  : Wall ended -> Clears corner lip (8cm), then pivots right.
-                     Automatically stops turning after 2.2s so it NEVER spins in circles!
-   - FIND_WALL     : Open space -> Drives forward to seek next wall.
-
-2. Generous Corner Threshold (WALL_LOST_DIST = 0.42m):
-   - Never falsely triggers corner mode when robot slightly drifts or adjusts.
-   - Triggers ONLY when the wall genuinely drops off (> 42 cm).
-
-3. Smooth Bounded PD Control:
-   - Proportional distance regulation with bounded heading damping.
-   - No runaway angular velocity spikes.
+Key Upgrades:
+1. Constant Wall Distance (Stanley Controller):
+   - Computes desired heading angle based on cross-track distance error:
+       desired_heading = atan2(KP_DIST * dist_error, forward_speed)
+   - Eliminates steady-state drift! If the robot drifts away, it smoothly angles
+     towards the wall, closes the gap quickly, and locks onto the 4cm target.
+2. Tight Corner Hugging (Outer Corner):
+   - Early corner detection at 0.32m (right at the corner vertex).
+   - Tight wrapping turn (R ≈ 7-8 cm) wraps closely around the 11cm corner lip.
+   - Never shoots forward into the corridor or sees the opposite wall!
+3. Crisp Inner Corner Pivoting:
+   - Zero forward motion (linear.x = 0.0), pivots in place until path opens.
 ===============================================================================
 """
 
@@ -50,28 +45,30 @@ class SimpleWallFollower(Node):
         # ---------------------------------------------------------------------
         # 2. DISTANCE THRESHOLDS
         # ---------------------------------------------------------------------
-        # Desired 5 cm air gap between right chassis edge and wall:
-        self.DESIRED_WALL_GAP = 0.05     # 5 cm air gap
-        self.TARGET_WALL_DIST = self.ROBOT_SIDE_OFFSET + self.DESIRED_WALL_GAP  # = 0.23m from LiDAR
+        # Desired 4 cm air gap between right chassis edge and wall:
+        self.DESIRED_WALL_GAP = 0.04     # 4 cm air gap
+        self.TARGET_WALL_DIST = self.ROBOT_SIDE_OFFSET + self.DESIRED_WALL_GAP  # = 0.22m from LiDAR
 
         # Front obstacle threshold (Inner corner / Wall Ahead):
         # Stop at 12 cm clearance from bumper so in-place rotation never hits wall
         self.DESIRED_FRONT_GAP = 0.12    # 12 cm air gap in front
         self.FRONT_STOP_DIST = self.ROBOT_FRONT_OFFSET + self.DESIRED_FRONT_GAP # = 0.32m
-        self.FRONT_CLEAR_DIST = self.ROBOT_FRONT_OFFSET + 0.20                  # = 0.40m to resume
+        self.FRONT_CLEAR_DIST = self.ROBOT_FRONT_OFFSET + 0.18                  # = 0.38m to resume
 
-        # Wall Lost threshold (Corner detection):
-        # 0.34m from LiDAR (16 cm air gap). Detects the corner opening early
-        # so the robot begins wrapping around the corner immediately without overshooting forward!
-        self.WALL_LOST_DIST = 0.34       # 0.34m from LiDAR
+        # Early Corner detection threshold:
+        # Detects the corner opening early (0.32m = 14 cm air gap)
+        # so the robot begins wrapping around the corner immediately!
+        self.WALL_LOST_DIST = 0.32       # 0.32m from LiDAR
 
         # ---------------------------------------------------------------------
-        # 3. SPEEDS & CONTROLLER GAINS
+        # 3. SPEEDS & CONTROLLER GAINS (Stanley Wall Following)
         # ---------------------------------------------------------------------
         self.FORWARD_SPEED = 0.13        # Cruise speed (m/s)
         self.TURN_SPEED = 0.60           # In-place pivot turn speed (rad/s)
-        self.KP = 2.2                    # Distance error gain
-        self.KD = 1.8                    # Heading alignment damping gain
+
+        # Stanley Controller Gains:
+        self.KP_DIST = 2.8               # Cross-track error to desired heading gain
+        self.KP_HEAD = 2.2               # Heading error to steering angular velocity gain
 
         # ---------------------------------------------------------------------
         # 4. SENSOR DISTANCES
@@ -100,7 +97,7 @@ class SimpleWallFollower(Node):
         # 10 Hz Control Loop Timer
         self.timer = self.create_timer(0.1, self.control_loop)
 
-        self.get_logger().info('>>> Stable Wall Follower initialized! Ready for LiDAR (/scan)...')
+        self.get_logger().info('>>> Stanley Wall Follower initialized! Ready for LiDAR (/scan)...')
 
     def set_state(self, new_state: str):
         if self.state != new_state:
@@ -139,24 +136,24 @@ class SimpleWallFollower(Node):
             angle = msg.angle_min + (i * msg.angle_increment)
             angle = self.normalize_angle(angle)
 
-            # 1. FRONT Corridor: -18° to +18° (-0.31 to +0.31 rad)
-            if -0.31 <= angle <= 0.31:
+            # 1. FRONT Corridor: -16° to +16° (-0.28 to +0.28 rad)
+            if -0.28 <= angle <= 0.28:
                 front_rays.append(dist)
 
-            # 2. FRONT-RIGHT: -60° to -30° (-1.05 to -0.52 rad)
-            elif -1.05 <= angle < -0.52:
+            # 2. FRONT-RIGHT: -55° to -35° (-0.96 to -0.61 rad)
+            elif -0.96 <= angle < -0.61:
                 front_right_rays.append(dist)
 
-            # 3. DIRECT RIGHT: -110° to -70° (-1.92 to -1.22 rad)
-            elif -1.92 <= angle <= -1.22:
+            # 3. DIRECT RIGHT: -105° to -75° (-1.83 to -1.31 rad)
+            elif -1.83 <= angle <= -1.31:
                 right_rays.append(dist)
 
-            # 4. REAR-RIGHT: -150° to -110° (-2.62 to -1.92 rad)
-            elif -2.62 <= angle < -1.92:
+            # 4. REAR-RIGHT: -145° to -115° (-2.53 to -2.01 rad)
+            elif -2.53 <= angle < -2.01:
                 rear_right_rays.append(dist)
 
-            # 5. DIRECT LEFT: +70° to +110° (+1.22 to +1.92 rad)
-            elif 1.22 <= angle <= 1.92:
+            # 5. DIRECT LEFT: +75° to +105° (+1.31 to +1.83 rad)
+            elif 1.31 <= angle <= 1.83:
                 left_rays.append(dist)
 
         self.dist_front = min(front_rays) if front_rays else float('inf')
@@ -194,17 +191,18 @@ class SimpleWallFollower(Node):
             action_name = "HUGGING OUTER CORNER"
 
             # Tight wrapping turn: DO NOT drive forward across the hallway!
-            # Use tiny forward creep (0.02 m/s) with strong right rotation (-0.65 rad/s)
-            # so the robot wraps tightly around the corner pivot and never reaches the opposite wall.
+            # Use small forward speed (0.05 m/s) with strong right rotation (-0.65 rad/s)
+            # Turning radius R = v / w = 0.05 / 0.65 ≈ 7.7 cm!
+            # The robot wraps tightly around the corner pivot and never reaches the opposite wall.
             if self.dist_front < self.FRONT_STOP_DIST:
                 cmd.linear.x = 0.0
                 cmd.angular.z = -self.TURN_SPEED
             else:
-                cmd.linear.x = 0.02   # 2 cm/s (almost zero forward displacement)
+                cmd.linear.x = 0.05   # 5 cm/s
                 cmd.angular.z = -0.65 # Fast, tight right turn around corner
 
-            # Exit as soon as the new wall is captured on the right
-            if elapsed > 0.3 and self.dist_right < (self.TARGET_WALL_DIST + 0.08) and self.dist_front > self.FRONT_STOP_DIST:
+            # Exit condition: As soon as the new wall is captured on the right side
+            if elapsed > 0.4 and self.dist_right < (self.TARGET_WALL_DIST + 0.08) and self.dist_front > self.FRONT_STOP_DIST:
                 self.set_state(self.STATE_FOLLOW_WALL)
 
             # If after 2.0s no wall is found, stop turning and seek wall forward
@@ -221,14 +219,14 @@ class SimpleWallFollower(Node):
             if self.dist_front < self.FRONT_STOP_DIST:
                 self.set_state(self.STATE_PIVOT_INNER)
             # If wall is found on the right, resume wall following!
-            elif self.dist_right < (self.TARGET_WALL_DIST + 0.12):
+            elif self.dist_right < (self.TARGET_WALL_DIST + 0.08):
                 self.set_state(self.STATE_FOLLOW_WALL)
             else:
                 cmd.linear.x = self.FORWARD_SPEED
-                cmd.angular.z = -0.08  # Very gentle bias towards right
+                cmd.angular.z = -0.10  # Gentle curve towards right
 
         # =====================================================================
-        # STATE 4: FOLLOW WALL (Normal PD Wall Following)
+        # STATE 4: FOLLOW WALL (Stanley Cross-Track & Heading Controller)
         # =====================================================================
         else:
             # 1. Obstacle in front -> Pivot Left
@@ -238,41 +236,48 @@ class SimpleWallFollower(Node):
                 cmd.angular.z = self.TURN_SPEED
                 action_name = "OBSTACLE IN FRONT -> Turn Left"
 
-            # 2. Outer Corner: Right wall dropped off (> 0.34m)
+            # 2. Outer Corner: Right wall dropped off (> 0.32m)
             elif self.dist_right > self.WALL_LOST_DIST and self.dist_front_right > self.WALL_LOST_DIST:
                 self.set_state(self.STATE_OUTER_CORNER)
-                cmd.linear.x = 0.02
+                cmd.linear.x = 0.05
                 cmd.angular.z = -0.65
                 action_name = "OUTER CORNER -> Turning Right"
 
-            # 3. Standard Wall Following with Smooth PD Control
+            # 3. Stanley Controller: Maintains CONSTANT 4 cm Distance
             else:
-                # Distance error (positive = closer than 5cm, steer left)
-                error_dist = self.TARGET_WALL_DIST - self.dist_right
+                # 3a. Cross-track distance error (positive = closer than 4cm, negative = further)
+                dist_error = self.TARGET_WALL_DIST - self.dist_right
 
-                # Heading alignment: compare front-right with perpendicular right
-                # When parallel: dist_front_right * 0.7071 ≈ dist_right
+                # 3b. Desired heading angle:
+                # If too far (dist_error < 0), desired_heading is negative (steer towards wall).
+                # If too close (dist_error > 0), desired_heading is positive (steer away from wall).
+                desired_heading = math.atan2(self.KP_DIST * dist_error, self.FORWARD_SPEED)
+                desired_heading = max(-0.35, min(0.35, desired_heading))  # Clamp to ±20 degrees
+
+                # 3c. Current heading angle relative to the wall:
+                # When parallel: dist_front_right * cos(45°) ≈ dist_right
                 if self.dist_front_right < float('inf') and self.dist_right < float('inf'):
-                    heading_err = (self.dist_front_right * 0.7071) - self.dist_right
-                    # Bound heading error to [-0.15, +0.15] to prevent violent jerks
-                    heading_err = max(-0.15, min(0.15, heading_err))
+                    diff = (self.dist_front_right * 0.7071) - self.dist_right
+                    actual_heading = math.atan2(diff, self.dist_front_right * 0.7071)
+                    actual_heading = max(-0.45, min(0.45, actual_heading))
                 else:
-                    heading_err = 0.0
+                    actual_heading = 0.0
 
-                # PD Control Law:
-                wz = (self.KP * error_dist) - (self.KD * heading_err)
-                wz = max(-0.45, min(0.45, wz))
+                # 3d. Steering law: drives actual heading to desired heading
+                heading_error = desired_heading - actual_heading
+                wz = self.KP_HEAD * heading_error
+                wz = max(-0.50, min(0.50, wz))
 
                 # Narrow corridor left-wall safety guard
                 if self.dist_left < (self.ROBOT_SIDE_OFFSET + 0.05) and wz > 0.0:
                     wz = min(wz, 0.02)
 
-                # Smooth adaptive speed: slow slightly when turning
+                # Adaptive speed
                 speed = self.FORWARD_SPEED if abs(wz) < 0.20 else (self.FORWARD_SPEED * 0.75)
 
                 cmd.linear.x = speed
                 cmd.angular.z = wz
-                action_name = f"FOLLOW WALL (e={error_dist*100:+.0f}cm, wz={wz:+.2f})"
+                action_name = f"STANLEY (e={dist_error*100:+.1f}cm, des_hdg={math.degrees(desired_heading):+.0f}°, wz={wz:+.2f})"
 
         # Publish velocity command
         self.cmd_pub.publish(cmd)
@@ -284,8 +289,8 @@ class SimpleWallFollower(Node):
             actual_right_gap = max(0.0, self.dist_right - self.ROBOT_SIDE_OFFSET)
             print(
                 f"[{self.state}] {action_name} | "
-                f"Right: {actual_right_gap*100:.0f}cm | "
-                f"Front: {actual_front_gap*100:.0f}cm | "
+                f"Right: {actual_right_gap*100:.1f}cm | "
+                f"Front: {actual_front_gap*100:.1f}cm | "
                 f"Cmd: (vx={cmd.linear.x:.2f}, wz={cmd.angular.z:.2f})"
             )
 
