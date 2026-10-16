@@ -1,0 +1,16 @@
+# Goal
+geometry_msgs/Point start_point
+geometry_msgs/Point target_point
+geometry_msgs/Point hit_point
+int8 follow_side
+
+---
+# Result
+bool success
+string message
+
+---
+# Feedback
+float64 distance_to_m_line
+float64 distance_to_target
+
