@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """
 ===============================================================================
-Robust LiDAR Wall Follower for Narrow Corridors (Right-Hand Rule)
+Optimized LiDAR Wall Follower with Dedicated Functional Beams
 ===============================================================================
-Specially tuned for narrow corridors (~0.50m) and tight corners:
-- Anti-Stuck & Anti-Collision:
-    * In-place pivots (linear.x = 0.0) ensure the robot never swings into opposite walls.
-    * Automatic Recovery: If the front bumper gets too close (< 6 cm), the robot 
-      automatically reverses straight back to clear its bumper before rotating.
-- Outer Corner Handling:
-    * Step 1 (CORNER_PASS): Creeps straight forward just enough to clear the 11cm lip.
-    * Step 2 (CORNER_TURN_RIGHT): Pivots in place to the right until the new wall is caught.
-- PD Wall Following:
-    * Tight 6 cm air gap from right wall with heading angle damping (no snaking/wobbling).
-    * Left-wall guard prevents scraping opposite corridor walls.
+Architectural Improvements:
+1. Dedicated Functional Beams (Replaces uniform sectoring):
+   - FRONT Corridor : -15° to +15° (collision buffer, never falsely clips side walls)
+   - WALL_FRONT     : ±45° (slope / lookahead beam)
+   - WALL_SIDE      : ±90° (perpendicular true wall distance)
+   - WALL_REAR      : ±135° (corner clearance / wheel axle monitor)
+   - OPPOSITE_SIDE  : ±90° (opposite corridor wall clearance)
+2. Exact Geometric Math:
+   - Calculates true perpendicular distance: D_true = D_90 * cos(tilt)
+   - Calculates exact heading tilt angle: tilt = atan2(D_45 * cos(45°) - D_90, ...)
+3. Reconfigurable:
+   - FOLLOW_SIDE = 'RIGHT' (default right-hand rule) or 'LEFT' (left-hand rule)
+4. Decisive, Crisp Cornering & High Speed:
+   - Cruise speed: 0.18 m/s, pivot turn: 0.60 rad/s
+   - Zero-radius in-place turns with minimum duration & cooldown
+   - Auto-Recovery reverse if within 5 cm of obstacle
 ===============================================================================
 """
 
@@ -28,88 +33,103 @@ from sensor_msgs.msg import LaserScan
 class SimpleWallFollower(Node):
     # State Machine Definitions
     STATE_FOLLOW_WALL = "FOLLOW_WALL"
-    STATE_PIVOT_LEFT = "PIVOT_LEFT"
+    STATE_PIVOT_INNER = "PIVOT_INNER"
     STATE_CORNER_PASS = "CORNER_PASS"
-    STATE_CORNER_TURN_RIGHT = "CORNER_TURN_RIGHT"
+    STATE_CORNER_PIVOT = "CORNER_PIVOT"
     STATE_RECOVERY = "RECOVERY"
     STATE_FIND_WALL = "FIND_WALL"
 
     def __init__(self):
         super().__init__('simple_wall_follower')
 
-        # ---------------------------------------------------------------------
-        # ROBOT PHYSICAL DIMENSIONS (Measured from LiDAR center to chassis edge)
-        # ---------------------------------------------------------------------
+        # =====================================================================
+        # 1. WALL FOLLOWING SIDE SELECTION
+        # =====================================================================
+        # 'RIGHT' -> Follow Right Wall (Default)
+        # 'LEFT'  -> Follow Left Wall
+        self.FOLLOW_SIDE = 'RIGHT'
+
+        # =====================================================================
+        # 2. PHYSICAL DIMENSIONS (LiDAR center to chassis edges)
+        # =====================================================================
         self.ROBOT_FRONT_OFFSET = 0.20   # Front bumper is 20 cm from LiDAR
         self.ROBOT_BACK_OFFSET  = 0.15   # Rear bumper is 15 cm from LiDAR
         self.ROBOT_SIDE_OFFSET  = 0.18   # Left/Right edges are 18 cm from LiDAR
 
-        # ---------------------------------------------------------------------
-        # TUNING PARAMETERS (Optimized for narrow ~50cm corridors & tight wall hugging)
-        # ---------------------------------------------------------------------
-        # 1. Right wall distance (6 cm physical air gap between right edge and wall):
-        self.DESIRED_RIGHT_GAP = 0.06    # 6 cm air gap (chassis hugs wall closely)
-        self.TARGET_WALL_DIST = self.ROBOT_SIDE_OFFSET + self.DESIRED_RIGHT_GAP  # = 0.24m from LiDAR
+        # =====================================================================
+        # 3. DISTANCE THRESHOLDS (Tuned for ultra-close 4cm wall hugging)
+        # =====================================================================
+        # 4 cm air gap between chassis edge and wall:
+        self.DESIRED_WALL_GAP = 0.04     # 4 cm physical air gap
+        self.TARGET_WALL_DIST = self.ROBOT_SIDE_OFFSET + self.DESIRED_WALL_GAP  # = 0.22m
 
-        # 2. Emergency collision buffer (If front bumper is within 6 cm of wall, reverse!):
-        self.COLLISION_BUFFER = self.ROBOT_FRONT_OFFSET + 0.06                   # = 0.26m from LiDAR
+        # Emergency reverse buffer (front bumper within 5 cm):
+        self.COLLISION_BUFFER = self.ROBOT_FRONT_OFFSET + 0.05                  # = 0.25m
 
-        # 3. Front obstacle threshold (Inner corner / Wall Ahead):
-        # Stop at 16 cm clearance so the front bumper never touches the front wall when rotating
-        self.DESIRED_FRONT_GAP = 0.16    # 16 cm air gap in front
-        self.FRONT_STOP_DIST = self.ROBOT_FRONT_OFFSET + self.DESIRED_FRONT_GAP  # = 0.36m from LiDAR
-        self.FRONT_CLEAR_DIST = self.ROBOT_FRONT_OFFSET + 0.24                   # = 0.44m to resume
+        # Inner corner / Wall ahead stop distance (15 cm clearance from front bumper):
+        self.DESIRED_FRONT_GAP = 0.15    # 15 cm air gap in front
+        self.FRONT_STOP_DIST = self.ROBOT_FRONT_OFFSET + self.DESIRED_FRONT_GAP # = 0.35m
+        self.FRONT_CLEAR_DIST = self.ROBOT_FRONT_OFFSET + 0.22                  # = 0.42m
 
-        # 4. Outer corner detection (Wall drops off to the right):
-        # If right side is further than chassis + 14 cm (0.32m), wall has ended
-        self.WALL_LOST_DIST = self.ROBOT_SIDE_OFFSET + 0.14                      # = 0.32m from LiDAR
-        
-        # 5. Front-right corner safety clearance:
-        self.CORNER_SAFETY_DIST = 0.28   # ~10 cm clearance from front-right bumper
+        # Wall lost threshold (outer corner opening):
+        self.WALL_LOST_DIST = self.ROBOT_SIDE_OFFSET + 0.11                     # = 0.29m
 
-        # 6. Speeds & Controller Gains:
-        self.FORWARD_SPEED = 0.12        # Cruise speed during straight wall following (m/s)
-        self.TURN_SPEED = 0.48           # In-place pivot speed (rad/s)
-        self.KP = 2.2                    # Proportional gain for distance error
-        self.KD = 3.0                    # Derivative gain for heading alignment
+        # =====================================================================
+        # 4. SPEEDS & CONTROLLER GAINS
+        # =====================================================================
+        self.FORWARD_SPEED_FAST = 0.18   # Straight cruise speed (m/s)
+        self.FORWARD_SPEED_SLOW = 0.11   # Turn entry / alignment speed (m/s)
+        self.TURN_SPEED = 0.60           # In-place pivot turn speed (rad/s)
+        self.KP = 2.5                    # Gain for perpendicular distance error
+        self.KD = 3.2                    # Gain for heading alignment error
 
-        # ---------------------------------------------------------------------
-        # SENSOR DISTANCES & STATE TRACKING
-        # ---------------------------------------------------------------------
-        self.dist_front = float('inf')
-        self.dist_front_right = float('inf')
-        self.dist_right = float('inf')
-        self.dist_rear_right = float('inf')
-        self.dist_left = float('inf')
-        self.dist_45 = float('inf')
-        self.dist_90 = float('inf')
+        # =====================================================================
+        # 5. DEDICATED FUNCTIONAL BEAMS (Distances in meters)
+        # =====================================================================
+        self.dist_front = float('inf')        # FRONT (-15° to +15°)
+        self.dist_wall_front = float('inf')   # ±45° (slope / lookahead)
+        self.dist_wall_side = float('inf')    # ±90° (perpendicular wall distance)
+        self.dist_wall_rear = float('inf')    # ±135° (corner axle clearance)
+        self.dist_opposite_side = float('inf')# Opposite ±90° (corridor guard)
 
+        # Derived real-time wall metrics
+        self.true_wall_dist = float('inf')
+        self.wall_tilt_deg = 0.0
+
+        # State tracking
         self.state = self.STATE_FOLLOW_WALL
         self.state_start_time = self.get_clock().now()
+        self.cooldown_end_time = self.get_clock().now()
         self.scan_count = 0
 
-        # ---------------------------------------------------------------------
-        # ROS 2 COMMUNICATION
-        # ---------------------------------------------------------------------
+        # =====================================================================
+        # 6. ROS 2 COMMUNICATION
+        # =====================================================================
         self.cmd_pub = self.create_publisher(Twist, '/robot_9/cmd_vel', 10)
+        self.cmd_pub_backup = self.create_publisher(Twist, '/cmd_vel', 10)
 
         sensor_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_callback, sensor_qos)
         self.scan_sub_backup = self.create_subscription(LaserScan, '/robot_9/scan', self.scan_callback, sensor_qos)
 
-        # 10 Hz Control Loop Timer (runs every 100 ms)
+        # 10 Hz Control Loop
         self.timer = self.create_timer(0.1, self.control_loop)
 
-        self.get_logger().info('>>> Robust Wall Follower initialized! Waiting for LiDAR (/scan)...')
+        self.get_logger().info(f'>>> Optimized Wall Follower ({self.FOLLOW_SIDE} Wall) started!')
 
-    def set_state(self, new_state: str):
+    def set_state(self, new_state: str, cooldown_sec: float = 0.0):
         if self.state != new_state:
             self.get_logger().info(f"[STATE CHANGE] {self.state} -> {new_state}")
             self.state = new_state
             self.state_start_time = self.get_clock().now()
+            if cooldown_sec > 0.0:
+                self.cooldown_end_time = self.get_clock().now() + rclpy.duration.Duration(seconds=cooldown_sec)
 
     def get_state_elapsed(self) -> float:
         return (self.get_clock().now() - self.state_start_time).nanoseconds / 1e9
+
+    def is_in_cooldown(self) -> bool:
+        return self.get_clock().now() < self.cooldown_end_time
 
     def normalize_angle(self, angle: float) -> float:
         """Wraps angle between [-pi, +pi] radians."""
@@ -120,19 +140,26 @@ class SimpleWallFollower(Node):
         return angle
 
     def scan_callback(self, msg: LaserScan):
-        """Extracts directional distances and key heading angles (-45° and -90°)."""
+        """
+        Extracts dedicated functional beams:
+        - FRONT Corridor : -15° to +15°
+        - WALL_FRONT     : 45° beam on following side
+        - WALL_SIDE      : 90° beam on following side
+        - WALL_REAR      : 135° beam on following side
+        - OPPOSITE_SIDE  : 90° beam on opposite side
+        """
         self.scan_count += 1
         num_rays = len(msg.ranges)
         if num_rays == 0:
             return
 
         front_rays = []
-        front_right_rays = []
-        right_rays = []
-        rear_right_rays = []
-        left_rays = []
-        rays_45 = []
-        rays_90 = []
+        wall_front_rays = []
+        wall_side_rays = []
+        wall_rear_rays = []
+        opposite_side_rays = []
+
+        is_right = (self.FOLLOW_SIDE == 'RIGHT')
 
         for i, dist in enumerate(msg.ranges):
             if math.isnan(dist) or math.isinf(dist) or dist <= msg.range_min or dist <= 0.05:
@@ -141,42 +168,56 @@ class SimpleWallFollower(Node):
             angle = msg.angle_min + (i * msg.angle_increment)
             angle = self.normalize_angle(angle)
 
-            # 1. Front Sector: -18° to +18° (-0.31 to +0.31 rad)
-            if -0.31 <= angle <= 0.31:
+            # 1. FRONT Corridor: -15° to +15° (-0.26 to +0.26 rad)
+            if -0.26 <= angle <= 0.26:
                 front_rays.append(dist)
 
-            # 2. Front-Right Diagonal: -65° to -25° (-1.13 to -0.44 rad)
-            elif -1.13 <= angle < -0.44:
-                front_right_rays.append(dist)
+            # Beams on Following Wall Side (Negative if RIGHT, Positive if LEFT)
+            if is_right:
+                # 45° Beam: -50° to -40° (-0.87 to -0.70 rad)
+                if -0.87 <= angle <= -0.70:
+                    wall_front_rays.append(dist)
+                # 90° Beam: -95° to -85° (-1.66 to -1.48 rad)
+                elif -1.66 <= angle <= -1.48:
+                    wall_side_rays.append(dist)
+                # 135° Beam: -140° to -125° (-2.44 to -2.18 rad)
+                elif -2.44 <= angle <= -2.18:
+                    wall_rear_rays.append(dist)
+                # Opposite 90° Beam (Left): +85° to +95° (+1.48 to +1.66 rad)
+                elif 1.48 <= angle <= 1.66:
+                    opposite_side_rays.append(dist)
+            else:
+                # 45° Beam: +40° to +50° (+0.70 to +0.87 rad)
+                if 0.70 <= angle <= 0.87:
+                    wall_front_rays.append(dist)
+                # 90° Beam: +85° to +95° (+1.48 to +1.66 rad)
+                elif 1.48 <= angle <= 1.66:
+                    wall_side_rays.append(dist)
+                # 135° Beam: +125° to +140° (+2.18 to +2.44 rad)
+                elif 2.18 <= angle <= 2.44:
+                    wall_rear_rays.append(dist)
+                # Opposite 90° Beam (Right): -95° to -85° (-1.66 to -1.48 rad)
+                elif -1.66 <= angle <= -1.48:
+                    opposite_side_rays.append(dist)
 
-            # 3. Direct Right: -110° to -70° (-1.92 to -1.22 rad)
-            elif -1.92 <= angle <= -1.22:
-                right_rays.append(dist)
-
-            # 4. Rear-Right: -150° to -110° (-2.62 to -1.92 rad)
-            elif -2.62 <= angle < -1.92:
-                rear_right_rays.append(dist)
-
-            # 5. Direct Left: +70° to +110° (+1.22 to +1.92 rad)
-            elif 1.22 <= angle <= 1.92:
-                left_rays.append(dist)
-
-            # Precise angles for heading alignment (PD control):
-            # Around -45° (-0.85 to -0.72 rad)
-            if -0.85 <= angle <= -0.72:
-                rays_45.append(dist)
-            # Around -90° (-1.64 to -1.50 rad)
-            if -1.64 <= angle <= -1.50:
-                rays_90.append(dist)
-
+        # Minimum for front obstacle detection
         self.dist_front = min(front_rays) if front_rays else float('inf')
-        self.dist_front_right = min(front_right_rays) if front_right_rays else float('inf')
-        self.dist_right = min(right_rays) if right_rays else float('inf')
-        self.dist_rear_right = min(rear_right_rays) if rear_right_rays else float('inf')
-        self.dist_left = min(left_rays) if left_rays else float('inf')
 
-        self.dist_45 = min(rays_45) if rays_45 else float('inf')
-        self.dist_90 = min(rays_90) if rays_90 else self.dist_right
+        # Averaged narrow cones for noise-free wall following
+        self.dist_wall_front = (sum(wall_front_rays) / len(wall_front_rays)) if wall_front_rays else float('inf')
+        self.dist_wall_side  = (sum(wall_side_rays) / len(wall_side_rays)) if wall_side_rays else float('inf')
+        self.dist_wall_rear  = (sum(wall_rear_rays) / len(wall_rear_rays)) if wall_rear_rays else float('inf')
+        self.dist_opposite_side = (sum(opposite_side_rays) / len(opposite_side_rays)) if opposite_side_rays else float('inf')
+
+        # Calculate exact geometric wall metrics (Tilt & True Perpendicular Distance)
+        if self.dist_wall_front < float('inf') and self.dist_wall_side < float('inf') and self.dist_wall_side < 2.0:
+            diff = (self.dist_wall_front * 0.7071) - self.dist_wall_side
+            tilt_rad = math.atan2(diff, self.dist_wall_front * 0.7071)
+            self.wall_tilt_deg = math.degrees(tilt_rad)
+            self.true_wall_dist = self.dist_wall_side * math.cos(tilt_rad)
+        else:
+            self.true_wall_dist = self.dist_wall_side
+            self.wall_tilt_deg = 0.0
 
     def control_loop(self):
         """10 Hz reactive decision-making loop."""
@@ -187,154 +228,169 @@ class SimpleWallFollower(Node):
         cmd = Twist()
         action_name = ""
         elapsed = self.get_state_elapsed()
+        is_right = (self.FOLLOW_SIDE == 'RIGHT')
+
+        # Direction signs based on side:
+        # For Right Wall: Inner corner turn = LEFT (+z), Outer corner turn = RIGHT (-z)
+        # For Left Wall : Inner corner turn = RIGHT (-z), Outer corner turn = LEFT (+z)
+        inner_turn_dir = +1.0 if is_right else -1.0
+        outer_turn_dir = -1.0 if is_right else +1.0
 
         # =====================================================================
         # SAFETY OVERRIDE: Active Recovery / Unsticking
-        # If the front bumper ever gets dangerously close (< 6cm) to a wall,
-        # automatically back up straight to clear space before rotating!
+        # If front bumper is within 5 cm of wall, reverse straight back!
         # =====================================================================
         if self.dist_front < self.COLLISION_BUFFER and self.state != self.STATE_RECOVERY:
             self.set_state(self.STATE_RECOVERY)
 
         # =====================================================================
-        # STATE 1: RECOVERY (Reverse Straight Back to Clear Trapped Bumper)
+        # STATE 1: RECOVERY (Reverse Straight Back to Free Bumper)
         # =====================================================================
         if self.state == self.STATE_RECOVERY:
-            cmd.linear.x = -0.07  # Reverse slowly
+            cmd.linear.x = -0.08
             cmd.angular.z = 0.0
             action_name = "RECOVERY (Reversing to Free Bumper)"
 
-            # Once front clearance is restored or 0.7s passed, pivot left safely
-            if self.dist_front > (self.ROBOT_FRONT_OFFSET + 0.14) or elapsed > 0.7:
-                self.set_state(self.STATE_PIVOT_LEFT)
+            if self.dist_front > (self.ROBOT_FRONT_OFFSET + 0.12) or elapsed > 0.6:
+                self.set_state(self.STATE_PIVOT_INNER)
 
         # =====================================================================
-        # STATE 2: PIVOT LEFT (Inner Corner / Wall Ahead)
+        # STATE 2: PIVOT INNER (Inner Corner / Wall Ahead)
         # =====================================================================
-        elif self.state == self.STATE_PIVOT_LEFT:
-            # Pivot STRICTLY IN PLACE (linear.x = 0.0) so robot footprint never advances into wall
+        elif self.state == self.STATE_PIVOT_INNER:
             cmd.linear.x = 0.0
-            cmd.angular.z = self.TURN_SPEED
-            action_name = "PIVOT LEFT (In-Place Turn)"
+            cmd.angular.z = inner_turn_dir * self.TURN_SPEED
+            action_name = f"PIVOT INNER (Turning {'Left' if inner_turn_dir > 0 else 'Right'})"
 
-            # Exit condition: Front has opened up and right side begins seeing wall
-            if self.dist_front > self.FRONT_CLEAR_DIST and self.dist_front_right > self.CORNER_SAFETY_DIST:
-                self.set_state(self.STATE_FOLLOW_WALL)
+            # Turn at least 1.2s to prevent premature exit
+            turn_completed = (
+                self.dist_front > self.FRONT_CLEAR_DIST and
+                (self.dist_wall_side < (self.WALL_LOST_DIST + 0.06) or self.dist_front > 0.65)
+            )
+            if (elapsed >= 1.2 and turn_completed) or elapsed > 3.2:
+                self.set_state(self.STATE_FOLLOW_WALL, cooldown_sec=0.5)
 
         # =====================================================================
         # STATE 3: CORNER PASS (Outer corner: wheel axle clearing corner)
         # =====================================================================
         elif self.state == self.STATE_CORNER_PASS:
-            # Creep straight forward just enough (~10-12 cm) for wheels to pass corner edge
-            cmd.linear.x = 0.08
+            cmd.linear.x = 0.10
             cmd.angular.z = 0.0
             action_name = "CORNER PASS (Clearing Axle)"
 
-            # If front obstacle approaches, stop forward motion immediately
+            # If front obstacle approaches, stop forward motion and pivot immediately
             if self.dist_front < self.FRONT_STOP_DIST:
-                self.set_state(self.STATE_CORNER_TURN_RIGHT)
-            # Wheels have cleared the corner edge after 1.2s or when rear-right clears
-            elif elapsed > 1.2 or (elapsed > 0.6 and self.dist_rear_right > self.WALL_LOST_DIST):
-                self.set_state(self.STATE_CORNER_TURN_RIGHT)
+                self.set_state(self.STATE_CORNER_PIVOT)
+            # Cleared corner when 135° beam clears or 1.2s passed (~12 cm forward)
+            elif elapsed >= 1.2 or (elapsed > 0.5 and self.dist_wall_rear > self.WALL_LOST_DIST):
+                self.set_state(self.STATE_CORNER_PIVOT)
 
         # =====================================================================
-        # STATE 4: CORNER TURN RIGHT (Tight In-Place Pivot around Corner)
+        # STATE 4: CORNER PIVOT (Tight In-Place Pivot around Corner)
         # =====================================================================
-        elif self.state == self.STATE_CORNER_TURN_RIGHT:
-            # Pivot IN PLACE (linear.x = 0.0) to wrap around corner without swinging into opposite wall!
+        elif self.state == self.STATE_CORNER_PIVOT:
             cmd.linear.x = 0.0
-            cmd.angular.z = -self.TURN_SPEED
-            action_name = "CORNER TURN RIGHT (In-Place Pivot Right)"
+            cmd.angular.z = outer_turn_dir * self.TURN_SPEED
+            action_name = f"CORNER PIVOT (In-Place Turn {'Right' if outer_turn_dir < 0 else 'Left'})"
 
-            # Exit condition: Wall is re-acquired on the right side and front is open
-            if self.dist_right < (self.TARGET_WALL_DIST + 0.08) and self.dist_front > self.FRONT_STOP_DIST:
-                self.set_state(self.STATE_FOLLOW_WALL)
-            # Timeout guard: If no wall found after 4.0s, seek wall
-            elif elapsed > 4.0:
-                self.set_state(self.STATE_FIND_WALL)
+            # Must turn at least 1.3s so it never aborts prematurely
+            turn_completed = (
+                self.dist_wall_side < (self.TARGET_WALL_DIST + 0.08) and
+                self.dist_front > self.FRONT_STOP_DIST
+            )
+            if (elapsed >= 1.3 and turn_completed) or elapsed > 3.6:
+                self.set_state(self.STATE_FOLLOW_WALL, cooldown_sec=0.5)
 
         # =====================================================================
-        # STATE 5: FIND WALL (Seek right wall if lost in open area)
+        # STATE 5: FIND WALL (Seek wall if lost in open space)
         # =====================================================================
         elif self.state == self.STATE_FIND_WALL:
-            action_name = "FIND WALL (Seeking Right Wall)"
+            action_name = f"FIND WALL (Seeking {self.FOLLOW_SIDE} Wall)"
             if self.dist_front < self.FRONT_STOP_DIST:
-                self.set_state(self.STATE_PIVOT_LEFT)
-            elif self.dist_right < self.WALL_LOST_DIST:
-                self.set_state(self.STATE_FOLLOW_WALL)
+                self.set_state(self.STATE_PIVOT_INNER)
+            elif self.dist_wall_side < self.WALL_LOST_DIST:
+                self.set_state(self.STATE_FOLLOW_WALL, cooldown_sec=0.5)
             else:
-                cmd.linear.x = 0.09
-                cmd.angular.z = -0.22
+                cmd.linear.x = 0.11
+                cmd.angular.z = outer_turn_dir * 0.25
 
         # =====================================================================
-        # STATE 6: FOLLOW WALL (Normal PD Wall Following)
+        # STATE 6: FOLLOW WALL (High-Speed PD Wall Following)
         # =====================================================================
         else:
-            # 1. Obstacle directly ahead -> Pivot Left
+            # 1. Obstacle directly ahead -> Pivot Inner
             if self.dist_front < self.FRONT_STOP_DIST:
-                self.set_state(self.STATE_PIVOT_LEFT)
+                self.set_state(self.STATE_PIVOT_INNER)
                 cmd.linear.x = 0.0
-                cmd.angular.z = self.TURN_SPEED
-                action_name = "OBSTACLE AHEAD -> Pivot Left"
+                cmd.angular.z = inner_turn_dir * self.TURN_SPEED
+                action_name = "OBSTACLE AHEAD -> Inner Pivot"
 
-            # 2. Outer corner detected: Right wall dropped off
-            elif self.dist_right > self.WALL_LOST_DIST and self.dist_front_right > self.WALL_LOST_DIST:
+            # 2. Outer corner detected: Wall on following side dropped off
+            elif not self.is_in_cooldown() and self.dist_wall_side > self.WALL_LOST_DIST and self.dist_wall_front > self.WALL_LOST_DIST:
                 self.set_state(self.STATE_CORNER_PASS)
-                cmd.linear.x = 0.08
+                cmd.linear.x = 0.10
                 cmd.angular.z = 0.0
-                action_name = "OUTER CORNER -> Creeping Past Lip"
+                action_name = f"OUTER CORNER ({self.FOLLOW_SIDE} Wall Dropped Off)"
 
-            # 3. Front-right bumper safety (gently steer away from angled walls)
-            elif self.dist_front_right < self.CORNER_SAFETY_DIST:
-                cmd.linear.x = self.FORWARD_SPEED * 0.5
-                cmd.angular.z = self.TURN_SPEED * 0.6
-                action_name = "AVOID CORNER (Steering Left)"
-
-            # 4. Standard Wall Following with PD Controller (Distance + Heading Angle)
+            # 3. Standard Wall Following with Geometric PD Controller
             else:
-                # Distance error (positive = too close to right wall, steer left)
-                error_dist = self.TARGET_WALL_DIST - self.dist_right
+                # Perpendicular distance error (positive = closer than 4cm)
+                error_dist = self.TARGET_WALL_DIST - self.true_wall_dist
 
-                # Heading alignment error (positive = nose tilted away from wall, steer right)
-                if self.dist_45 < float('inf') and self.dist_90 < float('inf'):
-                    heading_diff = (self.dist_45 * 0.7071) - self.dist_90
+                # Heading alignment error (positive = tilted away, negative = tilted into wall)
+                if self.dist_wall_front < float('inf') and self.dist_wall_side < float('inf'):
+                    heading_diff = (self.dist_wall_front * 0.7071) - self.dist_wall_side
                 else:
                     heading_diff = 0.0
 
                 # PD Control Law:
-                wz = (self.KP * error_dist) - (self.KD * heading_diff)
-                wz = max(-0.50, min(0.50, wz))
+                if is_right:
+                    wz = (self.KP * error_dist) - (self.KD * heading_diff)
+                else:
+                    wz = -((self.KP * error_dist) - (self.KD * heading_diff))
 
-                # Narrow corridor left-wall safety guard:
-                if self.dist_left < (self.ROBOT_SIDE_OFFSET + 0.05) and wz > 0.0:
-                    wz = min(wz, 0.02)
+                wz = max(-0.55, min(0.55, wz))
 
-                # Slow down slightly if steering adjustment is large
-                linear_x = self.FORWARD_SPEED if abs(wz) < 0.25 else (self.FORWARD_SPEED * 0.75)
+                # Opposite wall safety guard (avoid scraping opposite wall in narrow corridor)
+                if self.dist_opposite_side < (self.ROBOT_SIDE_OFFSET + 0.05):
+                    if is_right and wz > 0.0:
+                        wz = min(wz, 0.02)
+                    elif not is_right and wz < 0.0:
+                        wz = max(wz, -0.02)
+
+                # Dynamic Adaptive Speed:
+                # Full 0.18 m/s on straights, eases to 0.11 m/s when adjusting angle
+                if abs(wz) < 0.20 and self.dist_front > 0.55:
+                    linear_x = self.FORWARD_SPEED_FAST
+                else:
+                    linear_x = self.FORWARD_SPEED_SLOW
 
                 cmd.linear.x = linear_x
                 cmd.angular.z = wz
-                action_name = f"FOLLOW WALL (PD: e={error_dist*100:+.0f}cm, wz={wz:+.2f})"
+                action_name = (
+                    f"FOLLOW ({self.FOLLOW_SIDE}: D={self.true_wall_dist*100:.1f}cm, "
+                    f"Tilt={self.wall_tilt_deg:+.1f}°, wz={wz:+.2f})"
+                )
 
         # Publish velocity command
         self.cmd_pub.publish(cmd)
+        self.cmd_pub_backup.publish(cmd)
 
-        # Print telemetry every second (10 scans)
+        # Clean telemetry every second (10 scans)
         if self.scan_count % 10 == 0:
             actual_front_gap = max(0.0, self.dist_front - self.ROBOT_FRONT_OFFSET)
-            actual_right_gap = max(0.0, self.dist_right - self.ROBOT_SIDE_OFFSET)
-            actual_left_gap = max(0.0, self.dist_left - self.ROBOT_SIDE_OFFSET)
+            actual_wall_gap = max(0.0, self.true_wall_dist - self.ROBOT_SIDE_OFFSET)
             print(
                 f"[{self.state}] {action_name} | "
-                f"R-Gap: {actual_right_gap*100:.1f}cm | "
-                f"F-Gap: {actual_front_gap*100:.1f}cm | "
-                f"L-Gap: {actual_left_gap*100:.1f}cm | "
+                f"Wall-Gap: {actual_wall_gap*100:.1f}cm | "
+                f"Front-Gap: {actual_front_gap*100:.1f}cm | "
                 f"Cmd: (vx={cmd.linear.x:.2f}, wz={cmd.angular.z:.2f})"
             )
 
     def stop_robot(self):
         """Halts the robot."""
         self.cmd_pub.publish(Twist())
+        self.cmd_pub_backup.publish(Twist())
 
 
 def main(args=None):
