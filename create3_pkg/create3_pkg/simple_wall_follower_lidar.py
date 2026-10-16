@@ -36,7 +36,6 @@ class SimpleWallFollower(Node):
     STATE_PIVOT_INNER = "PIVOT_INNER"
     STATE_CORNER_PASS = "CORNER_PASS"
     STATE_CORNER_PIVOT = "CORNER_PIVOT"
-    STATE_RECOVERY = "RECOVERY"
     STATE_FIND_WALL = "FIND_WALL"
 
     def __init__(self):
@@ -63,13 +62,10 @@ class SimpleWallFollower(Node):
         self.DESIRED_WALL_GAP = 0.04     # 4 cm physical air gap
         self.TARGET_WALL_DIST = self.ROBOT_SIDE_OFFSET + self.DESIRED_WALL_GAP  # = 0.22m
 
-        # Emergency reverse buffer (front bumper within 5 cm):
-        self.COLLISION_BUFFER = self.ROBOT_FRONT_OFFSET + 0.05                  # = 0.25m
-
-        # Inner corner / Wall ahead stop distance (15 cm clearance from front bumper):
-        self.DESIRED_FRONT_GAP = 0.15    # 15 cm air gap in front
-        self.FRONT_STOP_DIST = self.ROBOT_FRONT_OFFSET + self.DESIRED_FRONT_GAP # = 0.35m
-        self.FRONT_CLEAR_DIST = self.ROBOT_FRONT_OFFSET + 0.22                  # = 0.42m
+        # Inner corner / Wall ahead stop distance (16 cm clearance from front bumper):
+        self.DESIRED_FRONT_GAP = 0.16    # 16 cm air gap in front
+        self.FRONT_STOP_DIST = self.ROBOT_FRONT_OFFSET + self.DESIRED_FRONT_GAP # = 0.36m
+        self.FRONT_CLEAR_DIST = self.ROBOT_FRONT_OFFSET + 0.24                  # = 0.44m
 
         # Wall lost threshold (outer corner opening):
         self.WALL_LOST_DIST = self.ROBOT_SIDE_OFFSET + 0.11                     # = 0.29m
@@ -237,41 +233,23 @@ class SimpleWallFollower(Node):
         outer_turn_dir = -1.0 if is_right else +1.0
 
         # =====================================================================
-        # SAFETY OVERRIDE: Active Recovery / Unsticking
-        # If front bumper is within 5 cm of wall, reverse straight back!
+        # STATE 1: PIVOT INNER (Inner Corner / Wall Ahead)
         # =====================================================================
-        if self.dist_front < self.COLLISION_BUFFER and self.state != self.STATE_RECOVERY:
-            self.set_state(self.STATE_RECOVERY)
-
-        # =====================================================================
-        # STATE 1: RECOVERY (Reverse Straight Back to Free Bumper)
-        # =====================================================================
-        if self.state == self.STATE_RECOVERY:
-            cmd.linear.x = -0.08
-            cmd.angular.z = 0.0
-            action_name = "RECOVERY (Reversing to Free Bumper)"
-
-            if self.dist_front > (self.ROBOT_FRONT_OFFSET + 0.12) or elapsed > 0.6:
-                self.set_state(self.STATE_PIVOT_INNER)
-
-        # =====================================================================
-        # STATE 2: PIVOT INNER (Inner Corner / Wall Ahead)
-        # =====================================================================
-        elif self.state == self.STATE_PIVOT_INNER:
+        if self.state == self.STATE_PIVOT_INNER:
             cmd.linear.x = 0.0
             cmd.angular.z = inner_turn_dir * self.TURN_SPEED
             action_name = f"PIVOT INNER (Turning {'Left' if inner_turn_dir > 0 else 'Right'})"
 
-            # Turn at least 1.2s to prevent premature exit
+            # Turn at least 1.0s to prevent premature exit
             turn_completed = (
                 self.dist_front > self.FRONT_CLEAR_DIST and
-                (self.dist_wall_side < (self.WALL_LOST_DIST + 0.06) or self.dist_front > 0.65)
+                (self.dist_wall_side < (self.WALL_LOST_DIST + 0.06) or self.dist_front > 0.60)
             )
-            if (elapsed >= 1.2 and turn_completed) or elapsed > 3.2:
+            if (elapsed >= 1.0 and turn_completed) or elapsed > 3.2:
                 self.set_state(self.STATE_FOLLOW_WALL, cooldown_sec=0.5)
 
         # =====================================================================
-        # STATE 3: CORNER PASS (Outer corner: wheel axle clearing corner)
+        # STATE 2: CORNER PASS (Outer corner: wheel axle clearing corner)
         # =====================================================================
         elif self.state == self.STATE_CORNER_PASS:
             cmd.linear.x = 0.10
@@ -286,7 +264,7 @@ class SimpleWallFollower(Node):
                 self.set_state(self.STATE_CORNER_PIVOT)
 
         # =====================================================================
-        # STATE 4: CORNER PIVOT (Tight In-Place Pivot around Corner)
+        # STATE 3: CORNER PIVOT (Tight In-Place Pivot around Corner)
         # =====================================================================
         elif self.state == self.STATE_CORNER_PIVOT:
             cmd.linear.x = 0.0
@@ -302,7 +280,7 @@ class SimpleWallFollower(Node):
                 self.set_state(self.STATE_FOLLOW_WALL, cooldown_sec=0.5)
 
         # =====================================================================
-        # STATE 5: FIND WALL (Seek wall if lost in open space)
+        # STATE 4: FIND WALL (Seek wall if lost in open space)
         # =====================================================================
         elif self.state == self.STATE_FIND_WALL:
             action_name = f"FIND WALL (Seeking {self.FOLLOW_SIDE} Wall)"
@@ -315,7 +293,7 @@ class SimpleWallFollower(Node):
                 cmd.angular.z = outer_turn_dir * 0.25
 
         # =====================================================================
-        # STATE 6: FOLLOW WALL (High-Speed PD Wall Following)
+        # STATE 5: FOLLOW WALL (High-Speed PD Wall Following)
         # =====================================================================
         else:
             # 1. Obstacle directly ahead -> Pivot Inner
