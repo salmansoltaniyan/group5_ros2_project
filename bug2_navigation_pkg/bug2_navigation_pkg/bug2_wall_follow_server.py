@@ -35,6 +35,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionServer, ActionClient, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from geometry_msgs.msg import Twist
@@ -210,7 +211,7 @@ class Bug2WallFollowServer(Node):
     # -------------------------------------------------------------------------
     def start_builtin_wall_follow(self, follow_side: int) -> bool:
         """Sends goal to Create 3 /robot_9/wall_follow asynchronously."""
-        if not self._builtin_client.wait_for_server(timeout_sec=3.0):
+        if not self._builtin_client.wait_for_server(timeout_sec=5.0):
             self.get_logger().error(f'❌ Built-in action server {self.wall_follow_action_name} not available!')
             return False
 
@@ -224,15 +225,15 @@ class Bug2WallFollowServer(Node):
         goal_msg.max_runtime.nanosec = 0
 
         self.get_logger().info(f'🤖 Sending WallFollow goal to Create 3 (Side: {"LEFT" if follow_side == 1 else "RIGHT"})...')
-        send_future = self._builtin_client.send_goal_async(goal_msg)
         
-        # Wait up to 3 seconds for acceptance without blocking executor
-        start_t = time.time()
-        while not send_future.done():
-            time.sleep(0.05)
-            if time.time() - start_t > 3.0:
-                self.get_logger().error('❌ Timeout waiting for Create 3 to accept WallFollow goal!')
-                return False
+        goal_response_event = threading.Event()
+        send_future = self._builtin_client.send_goal_async(goal_msg)
+        send_future.add_done_callback(lambda f: goal_response_event.set())
+        
+        # Wait up to 5.0 seconds for Create 3 response
+        if not goal_response_event.wait(timeout=5.0):
+            self.get_logger().error('❌ Timeout waiting for Create 3 to accept WallFollow goal!')
+            return False
 
         self._builtin_goal_handle = send_future.result()
         if not self._builtin_goal_handle.accepted:
@@ -261,17 +262,22 @@ class Bug2WallFollowServer(Node):
         """Cancels the active built-in action and halts robot movement."""
         if self._builtin_goal_handle is not None:
             self.get_logger().info('🛑 Canceling built-in Create 3 WallFollow goal...')
-            cancel_future = self._builtin_goal_handle.cancel_goal_async()
-            start_t = time.time()
-            while not cancel_future.done():
-                time.sleep(0.05)
-                if time.time() - start_t > 2.0:
+            try:
+                cancel_event = threading.Event()
+                cancel_future = self._builtin_goal_handle.cancel_goal_async()
+                cancel_future.add_done_callback(lambda f: cancel_event.set())
+                if not cancel_event.wait(timeout=3.0):
                     self.get_logger().warn('Timeout waiting for built-in cancel confirmation.')
-                    break
+                else:
+                    self.get_logger().info('✅ Built-in Create 3 WallFollow canceled successfully.')
+            except Exception as e:
+                self.get_logger().warn(f'Exception during built-in cancel: {e}')
 
-        # Publish zero velocity command to guarantee immediate halt
+        # Publish zero velocity command multiple times to guarantee immediate halt
         stop_twist = Twist()
-        self.cmd_pub.publish(stop_twist)
+        for _ in range(3):
+            self.cmd_pub.publish(stop_twist)
+            time.sleep(0.02)
 
     # -------------------------------------------------------------------------
     # BUG 2 EXECUTE LOOP
@@ -472,12 +478,15 @@ class Bug2WallFollowServer(Node):
 def main(args=None):
     rclpy.init(args=args)
     server = Bug2WallFollowServer()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(server)
     try:
-        rclpy.spin(server)
+        executor.spin()
     except KeyboardInterrupt:
         server.get_logger().info('Shutting down Bug2WallFollowServer safely...')
     finally:
         server.cancel_builtin_wall_follow()
+        executor.shutdown()
         server.destroy_node()
         rclpy.shutdown()
 
