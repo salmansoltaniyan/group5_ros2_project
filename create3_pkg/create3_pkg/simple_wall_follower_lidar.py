@@ -61,23 +61,31 @@ class SimpleWallFollower(Node):
         self.WALL_LOST_DIST = 0.32       # 0.32m from LiDAR
 
         # ---------------------------------------------------------------------
-        # 3. SPEEDS & CONTROLLER GAINS (Stanley Wall Following)
+        # 3. SPEEDS & CONTROLLER GAINS (Stanley Wall Following - Smoothed)
         # ---------------------------------------------------------------------
-        self.FORWARD_SPEED = 0.13        # Cruise speed (m/s)
+        self.FORWARD_SPEED = 0.12        # Cruise speed (m/s) - stable cruising
         self.TURN_SPEED = 0.60           # In-place pivot turn speed (rad/s)
 
-        # Stanley Controller Gains:
-        self.KP_DIST = 2.8               # Cross-track error to desired heading gain
-        self.KP_HEAD = 2.2               # Heading error to steering angular velocity gain
+        # Stanley Controller Gains (Smooth & Non-Oscillating):
+        self.KP_DIST = 0.75              # Cross-track error gain (1cm error -> ~3.3° heading)
+        self.KP_HEAD = 1.35              # Heading alignment damping gain
+        self.DEADBAND_DIST = 0.007       # 7mm deadband around 4cm target to eliminate hunting
+        self.MAX_STEER_WZ = 0.22         # Gentle steering cap for straight walls (rad/s)
+        self.prev_wz = 0.0               # Slew rate limiter memory
+        self.MAX_WZ_ACCEL = 0.06         # Max change in wz per 0.1s tick (smooth acceleration)
 
         # ---------------------------------------------------------------------
-        # 4. SENSOR DISTANCES
+        # 4. SENSOR DISTANCES & FILTERS
         # ---------------------------------------------------------------------
         self.dist_front = float('inf')
         self.dist_front_right = float('inf')
         self.dist_right = float('inf')
         self.dist_rear_right = float('inf')
         self.dist_left = float('inf')
+
+        # Exponential Moving Average (EMA) filters for noise reduction
+        self.filt_dist_right = None
+        self.filt_dist_front_right = None
 
         # State tracking
         self.state = self.STATE_FOLLOW_WALL
@@ -104,6 +112,7 @@ class SimpleWallFollower(Node):
             self.get_logger().info(f"[STATE CHANGE] {self.state} -> {new_state}")
             self.state = new_state
             self.state_start_time = self.get_clock().now()
+            self.prev_wz = 0.0
 
     def get_state_elapsed(self) -> float:
         return (self.get_clock().now() - self.state_start_time).nanoseconds / 1e9
@@ -161,6 +170,24 @@ class SimpleWallFollower(Node):
         self.dist_right = min(right_rays) if right_rays else float('inf')
         self.dist_rear_right = min(rear_right_rays) if rear_right_rays else float('inf')
         self.dist_left = min(left_rays) if left_rays else float('inf')
+
+        # Exponential Moving Average (EMA) filtering on right-side beams
+        ALPHA = 0.35
+        if not math.isinf(self.dist_right):
+            if self.filt_dist_right is None:
+                self.filt_dist_right = self.dist_right
+            else:
+                self.filt_dist_right = (1.0 - ALPHA) * self.filt_dist_right + ALPHA * self.dist_right
+        else:
+            self.filt_dist_right = float('inf')
+
+        if not math.isinf(self.dist_front_right):
+            if self.filt_dist_front_right is None:
+                self.filt_dist_front_right = self.dist_front_right
+            else:
+                self.filt_dist_front_right = (1.0 - ALPHA) * self.filt_dist_front_right + ALPHA * self.dist_front_right
+        else:
+            self.filt_dist_front_right = float('inf')
 
     def control_loop(self):
         """10 Hz decision-making control loop."""
@@ -243,41 +270,52 @@ class SimpleWallFollower(Node):
                 cmd.angular.z = -0.65
                 action_name = "OUTER CORNER -> Turning Right"
 
-            # 3. Stanley Controller: Maintains CONSTANT 4 cm Distance
+            # 3. Stanley Controller: Maintains CONSTANT 4 cm Distance (Smooth & Stable)
             else:
+                right_d = self.filt_dist_right if self.filt_dist_right is not None else self.dist_right
+                fr_d = self.filt_dist_front_right if self.filt_dist_front_right is not None else self.dist_front_right
+
                 # 3a. Cross-track distance error (positive = closer than 4cm, negative = further)
-                dist_error = self.TARGET_WALL_DIST - self.dist_right
+                dist_error = self.TARGET_WALL_DIST - right_d
+
+                # Deadband: if within deadband of target distance, suppress error to eliminate hunting
+                if abs(dist_error) < self.DEADBAND_DIST:
+                    dist_error = 0.0
 
                 # 3b. Desired heading angle:
-                # If too far (dist_error < 0), desired_heading is negative (steer towards wall).
-                # If too close (dist_error > 0), desired_heading is positive (steer away from wall).
+                # Soft gain: gentle slope towards wall (never aggressive)
                 desired_heading = math.atan2(self.KP_DIST * dist_error, self.FORWARD_SPEED)
-                desired_heading = max(-0.35, min(0.35, desired_heading))  # Clamp to ±20 degrees
+                desired_heading = max(-0.21, min(0.21, desired_heading))  # Clamp to ±12 degrees
 
                 # 3c. Current heading angle relative to the wall:
-                # When parallel: dist_front_right * cos(45°) ≈ dist_right
-                if self.dist_front_right < float('inf') and self.dist_right < float('inf'):
-                    diff = (self.dist_front_right * 0.7071) - self.dist_right
-                    actual_heading = math.atan2(diff, self.dist_front_right * 0.7071)
-                    actual_heading = max(-0.45, min(0.45, actual_heading))
+                # When parallel: fr_d * cos(45°) ≈ right_d
+                if fr_d < float('inf') and right_d < float('inf'):
+                    diff = (fr_d * 0.7071) - right_d
+                    actual_heading = math.atan2(diff, fr_d * 0.7071)
+                    actual_heading = max(-0.35, min(0.35, actual_heading))
                 else:
                     actual_heading = 0.0
 
                 # 3d. Steering law: drives actual heading to desired heading
                 heading_error = desired_heading - actual_heading
-                wz = self.KP_HEAD * heading_error
-                wz = max(-0.50, min(0.50, wz))
+                target_wz = self.KP_HEAD * heading_error
+                target_wz = max(-self.MAX_STEER_WZ, min(self.MAX_STEER_WZ, target_wz))
 
                 # Narrow corridor left-wall safety guard
-                if self.dist_left < (self.ROBOT_SIDE_OFFSET + 0.05) and wz > 0.0:
-                    wz = min(wz, 0.02)
+                if self.dist_left < (self.ROBOT_SIDE_OFFSET + 0.05) and target_wz > 0.0:
+                    target_wz = min(target_wz, 0.02)
 
-                # Adaptive speed
-                speed = self.FORWARD_SPEED if abs(wz) < 0.20 else (self.FORWARD_SPEED * 0.75)
+                # Slew rate limiter: smooth acceleration of angular velocity (no jerks)
+                wz_diff = target_wz - self.prev_wz
+                if abs(wz_diff) > self.MAX_WZ_ACCEL:
+                    wz = self.prev_wz + math.copysign(self.MAX_WZ_ACCEL, wz_diff)
+                else:
+                    wz = target_wz
+                self.prev_wz = wz
 
-                cmd.linear.x = speed
+                cmd.linear.x = self.FORWARD_SPEED
                 cmd.angular.z = wz
-                action_name = f"STANLEY (e={dist_error*100:+.1f}cm, des_hdg={math.degrees(desired_heading):+.0f}°, wz={wz:+.2f})"
+                action_name = f"STANLEY (e={dist_error*100:+.1f}cm, des={math.degrees(desired_heading):+.0f}°, act={math.degrees(actual_heading):+.0f}°, wz={wz:+.2f})"
 
         # Publish velocity command
         self.cmd_pub.publish(cmd)
