@@ -63,6 +63,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from irobot_create_msgs.msg import IrIntensityVector
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 
 
 # ─── State constants ──────────────────────────────────────────────────────────
@@ -98,24 +99,27 @@ class Bug2Node(Node):
 
         # ── Parameters ────────────────────────────────────────────────────────
         self.declare_parameter('namespace',             'robot_9')
-        self.declare_parameter('goal_x',                2.0)   # meters ahead (+X)
-        self.declare_parameter('goal_y',                0.0)   # meters lateral (+Y = left)
+
+        # Allow dynamic typing (float or int) for coordinates and tolerances
+        float_or_int = ParameterDescriptor(dynamic_typing=True)
+        self.declare_parameter('goal_x',                2.0,  float_or_int)
+        self.declare_parameter('goal_y',                0.0,  float_or_int)
 
         # Speeds
-        self.declare_parameter('linear_speed',          0.15)
-        self.declare_parameter('wall_speed',            0.12)
-        self.declare_parameter('angular_speed',         0.50)
+        self.declare_parameter('linear_speed',          0.15, float_or_int)
+        self.declare_parameter('wall_speed',            0.12, float_or_int)
+        self.declare_parameter('angular_speed',         0.50, float_or_int)
 
         # IR thresholds  (raw ADC counts; typical range 0–200+ in open air, 400+ near wall)
-        self.declare_parameter('front_ir_threshold',    150)   # "wall in front" — raised from 100 to reduce false triggers from floor reflections
-        self.declare_parameter('side_ir_threshold',     80)    # "wall detected on side"
-        self.declare_parameter('desired_side_ir',       120)   # target side distance
+        self.declare_parameter('front_ir_threshold',    150,  float_or_int)
+        self.declare_parameter('side_ir_threshold',     80,   float_or_int)
+        self.declare_parameter('desired_side_ir',       120,  float_or_int)
 
         # Navigation tolerances
-        self.declare_parameter('goal_tolerance',        0.15)
-        self.declare_parameter('m_line_tolerance',      0.15)  # was 0.10 — widened to 15cm band
-        self.declare_parameter('leave_progress_margin', 0.02)  # was 0.15 — only 2cm progress needed to leave
-        self.declare_parameter('min_hit_clearance',     0.30)
+        self.declare_parameter('goal_tolerance',        0.15, float_or_int)
+        self.declare_parameter('m_line_tolerance',      0.15, float_or_int)
+        self.declare_parameter('leave_progress_margin', 0.02, float_or_int)
+        self.declare_parameter('min_hit_clearance',     0.30, float_or_int)
 
         # Fetch values
         ns                        = self.get_parameter('namespace').value
