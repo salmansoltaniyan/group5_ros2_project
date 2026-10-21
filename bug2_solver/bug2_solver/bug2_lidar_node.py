@@ -218,11 +218,11 @@ class Bug2LidarNode(Node):
         # Pre-compute angle for each ray (once per scan)
         # Sectors: accumulate min valid range per sector
         sectors = {
-            'front':       float('inf'),   # -15° to +15° (Narrow corridor directly in front)
-            'front_right': float('inf'),   # -50° to -15° (Diagonal corner)
-            'right':       float('inf'),   # -110° to -70° (Perpendicular right wall)
-            'rear_right':  float('inf'),   # -160° to -120° (Rear alignment check)
-            'front_left':  float('inf'),   # +15° to +50°
+            'front':       float('inf'),   # -20° to +20° (Forward cone)
+            'front_right': float('inf'),   # -50° to -20° (Corner safety)
+            'right':       float('inf'),   # -110° to -70° (Wall sensing)
+            'rear_right':  float('inf'),   # -160° to -120°
+            'front_left':  float('inf'),   # +20° to +50°
             'left':        float('inf'),   # +70° to +110°
         }
 
@@ -240,15 +240,15 @@ class Bug2LidarNode(Node):
                 angle_deg += 360.0
 
             # Classify into sector
-            if   -15.0 <= angle_deg <= 15.0:
+            if   -20.0 <= angle_deg <= 20.0:
                 sectors['front']       = min(sectors['front'], r)
-            if   -50.0 <= angle_deg < -15.0:
+            if   -50.0 <= angle_deg < -20.0:
                 sectors['front_right'] = min(sectors['front_right'], r)
             if  -110.0 <= angle_deg < -70.0:
                 sectors['right']       = min(sectors['right'], r)
             if  -160.0 <= angle_deg < -120.0:
                 sectors['rear_right']  = min(sectors['rear_right'], r)
-            if    15.0 <  angle_deg <= 50.0:
+            if    20.0 <  angle_deg <= 50.0:
                 sectors['front_left']  = min(sectors['front_left'], r)
             if    70.0 <  angle_deg <= 110.0:
                 sectors['left']        = min(sectors['left'], r)
@@ -414,55 +414,25 @@ class Bug2LidarNode(Node):
                     f'dist_to_goal={d:.2f} m  →  GO_TO_GOAL')
                 return
 
-        # ── ORTHOGONAL MAZE WALL-FOLLOW (EXACT 90-DEGREE ROTATIONS) ───────────
-        
-        # 1. If currently executing an exact 90-degree turn in-place:
-        if self.turn_in_progress:
-            yaw_err = _angle_diff(self.target_turn_yaw, self.curr_yaw)
-            if abs(yaw_err) < 0.05:  # within ~3 degrees of target
-                # Turn completed! Stop turning and resume forward drive
-                self.turn_in_progress = False
-                self._stop()
-            else:
-                turn_dir = 1.0 if yaw_err > 0 else -1.0
-                turn_spd = max(0.20, min(self.angular_speed, abs(yaw_err) * 1.5))
-                self._publish(0.0, turn_spd * turn_dir)
-            return
+        # ── SIMPLE & ROBUST WALL-FOLLOWING LOGIC ──────────────────────────────
+        # Front safety: bumper is 20cm from LiDAR. Stop and turn if obstacle < 28cm
+        front_too_close = (self.lidar_front < 0.28 or self.lidar_front_right < 0.28)
 
-        # 2. Check for front obstacle (Inner 90-degree Corner)
-        # Bumper is 20cm from LiDAR; trigger at 0.25m
-        if self.lidar_front < 0.25 or self.lidar_front_right < 0.24:
-            # Initiate EXACT 90-degree LEFT turn (+pi/2)
-            self.turn_in_progress = True
-            target_raw = self.curr_yaw + (math.pi / 2.0)
-            # Normalize to [-pi, pi]
-            self.target_turn_yaw = math.atan2(math.sin(target_raw), math.cos(target_raw))
+        if front_too_close:
+            # 1. Obstacle ahead (Inner Corner / Dead-end): Turn left in-place
             self._publish(0.0, self.angular_speed)
-            return
 
-        # 3. Check for wall disappearance on the right (Outer 90-degree Corner)
-        right_wall_present = (self.lidar_right <= self.side_dist_thr)
-        if not right_wall_present:
-            # Wall ended! Creep slightly forward then initiate EXACT 90-degree RIGHT turn (-pi/2)
-            self.turn_in_progress = True
-            target_raw = self.curr_yaw - (math.pi / 2.0)
-            self.target_turn_yaw = math.atan2(math.sin(target_raw), math.cos(target_raw))
-            # First small nudge forward so wheels clear the edge, then turn right
-            self._publish(self.wall_speed * 0.4, -self.angular_speed)
-            return
+        elif self.lidar_right < 0.18:
+            # 2. Too close to right wall: Creep forward and steer gently LEFT
+            self._publish(self.wall_speed, 0.25)
 
-        # 4. Straight Wall Driving (Hallway Tracking)
-        # Target distance = desired_wall_dist (0.21m)
-        dist_err = self.lidar_right - self.desired_wall_dist
-        
-        if abs(dist_err) < 0.02:
-            # Perfectly aligned, drive straight without any angular wobble
-            self._publish(self.wall_speed, 0.0)
+        elif self.lidar_right > 0.26:
+            # 3. Too far from right wall (or Outer Corner): Steer gently RIGHT
+            self._publish(self.wall_speed * 0.8, -0.35)
+
         else:
-            # Minor micro-trimming to stay at 5cm distance
-            trim_ang = -1.2 * dist_err
-            trim_ang = max(-0.15, min(0.15, trim_ang))  # gentle micro-trim (max ~8 deg/s)
-            self._publish(self.wall_speed, trim_ang)
+            # 4. In perfect sweet spot (~21cm LiDAR, ~5cm body): Drive straight!
+            self._publish(self.wall_speed, 0.0)
 
     # ── Periodic telemetry ────────────────────────────────────────────────────
 
