@@ -113,8 +113,8 @@ class Bug2Node(Node):
 
         # Navigation tolerances
         self.declare_parameter('goal_tolerance',        0.15)
-        self.declare_parameter('m_line_tolerance',      0.10)
-        self.declare_parameter('leave_progress_margin', 0.15)
+        self.declare_parameter('m_line_tolerance',      0.15)  # was 0.10 — widened to 15cm band
+        self.declare_parameter('leave_progress_margin', 0.02)  # was 0.15 — only 2cm progress needed to leave
         self.declare_parameter('min_hit_clearance',     0.30)
 
         # Fetch values
