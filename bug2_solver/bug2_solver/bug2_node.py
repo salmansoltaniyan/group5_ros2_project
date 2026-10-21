@@ -107,7 +107,7 @@ class Bug2Node(Node):
         self.declare_parameter('angular_speed',         0.50)
 
         # IR thresholds  (raw ADC counts; typical range 0–200+ in open air, 400+ near wall)
-        self.declare_parameter('front_ir_threshold',    100)   # "wall in front"
+        self.declare_parameter('front_ir_threshold',    150)   # "wall in front" — raised from 100 to reduce false triggers from floor reflections
         self.declare_parameter('side_ir_threshold',     80)    # "wall detected on side"
         self.declare_parameter('desired_side_ir',       120)   # target side distance
 
@@ -139,6 +139,7 @@ class Bug2Node(Node):
 
         # Odometry
         self.start_x = self.start_y = 0.0
+        self.start_yaw            = 0.0
         self.start_recorded       = False
         self.curr_x = self.curr_y = self.curr_yaw = 0.0
 
@@ -218,11 +219,18 @@ class Bug2Node(Node):
     def _record_start(self):
         self.start_x = self.curr_x
         self.start_y = self.curr_y
+        self.start_yaw = self.curr_yaw
         self.start_recorded = True
 
+        # Rotate (goal_dx, goal_dy) by start_yaw so goal is relative to robot's initial heading!
+        cos_yaw = math.cos(self.start_yaw)
+        sin_yaw = math.sin(self.start_yaw)
+        world_dx = self.goal_dx * cos_yaw - self.goal_dy * sin_yaw
+        world_dy = self.goal_dx * sin_yaw + self.goal_dy * cos_yaw
+
         # World-frame goal
-        self.goal_x = self.start_x + self.goal_dx
-        self.goal_y = self.start_y + self.goal_dy
+        self.goal_x = self.start_x + world_dx
+        self.goal_y = self.start_y + world_dy
 
         # M-line  A*x + B*y + C = 0   (line through Start and Goal)
         dx = self.goal_x - self.start_x
@@ -300,16 +308,16 @@ class Bug2Node(Node):
             self.get_logger().info('★  GOAL REACHED  ★')
             return
 
-        # Obstacle in front?
-        if self.ir_front >= self.front_ir_thr:
-            self._enter_wall_follow()
-            return
-
         # Steer toward goal
         angle_to_goal = math.atan2(
             self.goal_y - self.curr_y,
             self.goal_x - self.curr_x)
         err = _angle_diff(angle_to_goal, self.curr_yaw)
+
+        # Obstacle in front? Check only when reasonably facing the goal direction
+        if abs(err) <= 0.60 and self.ir_front >= self.front_ir_thr:
+            self._enter_wall_follow()
+            return
 
         if abs(err) > 0.30:          # > ~17° → turn in place
             self._publish(0.0, self.angular_speed * (1.0 if err > 0 else -1.0))
