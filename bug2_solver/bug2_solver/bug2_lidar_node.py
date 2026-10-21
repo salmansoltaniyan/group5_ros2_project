@@ -408,34 +408,47 @@ class Bug2LidarNode(Node):
 
         # 4. Right-hand wall-follow logic (6-sector)
         front_blocked       = self.lidar_front       <= self.front_dist_thr
-        front_right_blocked = self.lidar_front_right  <= self.corner_dist_thr
+        front_right_blocked = self.lidar_front_right <= self.corner_dist_thr
         right_present       = self.lidar_right        <= self.side_dist_thr
         rear_right_present  = self.lidar_rear_right   <= self.side_dist_thr
 
         if front_blocked or front_right_blocked:
-            # ── CASE 1: Wall ahead or approaching corner → turn LEFT in place
-            self._publish(0.0, self.angular_speed)
+            # ── CASE 1: Wall ahead or corner blocked → turn LEFT
+            # If extremely close in front (< 0.22m), turn in place; otherwise turn while creeping
+            if self.lidar_front < 0.22 or self.lidar_front_right < 0.25:
+                self._publish(0.0, self.angular_speed)
+            else:
+                self._publish(self.wall_speed * 0.3, self.angular_speed)
 
         elif not right_present and not rear_right_present:
-            # ── CASE 2: Completely lost right wall → turn RIGHT to find it
-            #    Both right and rear-right are empty: open space on the right
-            #    Turn right more aggressively while moving slowly forward
-            self._publish(self.wall_speed * 0.5, -self.angular_speed * 0.7)
+            # ── CASE 2: Lost right wall completely → curve gently to right
+            self._publish(self.wall_speed * 0.7, -self.angular_speed * 0.4)
 
         elif not right_present and rear_right_present:
-            # ── CASE 3: Outer corner — wall ending
-            #    Right is clear but rear-right still has a wall: robot is passing
-            #    the end of a wall. Go forward and turn right gently to wrap around.
-            self._publish(self.wall_speed, -self.angular_speed * 0.4)
+            # ── CASE 3: Outer corner (wall ended on side, still visible behind)
+            self._publish(self.wall_speed * 0.5, -self.angular_speed * 0.5)
 
         else:
-            # ── CASE 4: Wall on right → proportional distance control
-            #    error > 0 → too far from wall  → turn right (negative angular)
-            #    error < 0 → too close to wall  → turn left  (positive angular)
-            error = self.lidar_right - self.desired_wall_dist
-            kp = 2.5
-            ang = kp * error
+            # ── CASE 4: Wall on right → Stable PD distance & heading control
+            # Distance error: positive means too far from wall
+            dist_error = self.lidar_right - self.desired_wall_dist
+
+            # Alignment error: difference between rear and right sensor
+            # If rear > right, robot is pitched pointing into the wall
+            if math.isfinite(self.lidar_rear_right) and self.lidar_rear_right < self.side_dist_thr:
+                align_error = self.lidar_rear_right - self.lidar_right
+            else:
+                align_error = 0.0
+
+            # Correct sign convention for ROS standard (ang > 0 is CCW / Left, ang < 0 is CW / Right):
+            # - When dist_error > 0 (too far), turn RIGHT (ang < 0)
+            # - When dist_error < 0 (too close), turn LEFT (ang > 0)
+            # - When align_error > 0 (heading into wall), turn LEFT (ang > 0) to align parallel
+            kp_dist = 2.2
+            kp_align = 1.5
+            ang = -kp_dist * dist_error + kp_align * align_error
             ang = max(-self.angular_speed, min(self.angular_speed, ang))
+
             self._publish(self.wall_speed, ang)
 
     # ── Periodic telemetry ────────────────────────────────────────────────────
