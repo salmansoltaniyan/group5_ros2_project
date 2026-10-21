@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'bug2_node = bug2_solver.bug2_node:main',
+            'bug2_lidar_node = bug2_solver.bug2_lidar_node:main',
         ],
     },
 )
