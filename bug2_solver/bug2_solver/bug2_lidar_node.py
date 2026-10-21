@@ -149,6 +149,7 @@ class Bug2LidarNode(Node):
         self.hit_x = self.hit_y   = 0.0
         self.hit_dist_to_goal      = float('inf')
         self.hit_clearance_ok      = False
+        self.in_corner_turn        = False  # Lock mode for inner-corner 90-degree turning
 
         # LiDAR 6-sector distances (meters, inf = nothing detected)
         self.lidar_front       = float('inf')   # -30° to +30°
@@ -406,33 +407,50 @@ class Bug2LidarNode(Node):
                     f'dist_to_goal={d:.2f} m  →  GO_TO_GOAL')
                 return
 
-        # 4. Smooth Right-hand wall-follow logic
-        front_blocked       = self.lidar_front       <= self.front_dist_thr
-        front_right_blocked = self.lidar_front_right <= self.corner_dist_thr
-        right_present       = self.lidar_right        <= self.side_dist_thr
+        # ── 3-STATE WALL-FOLLOWING LOGIC ──────────────────────────────────────
+        # Front clearance safety: bumper is 20cm from LiDAR.
+        # Trigger turn when closer than 0.26m (~6cm clearance)
+        front_obstacle = (self.lidar_front < 0.26 or self.lidar_front_right < 0.25)
+        # Clear distance required to EXIT corner turn (corridor must open up to at least 40cm)
+        front_cleared  = (self.lidar_front > 0.40 and self.lidar_front_right > 0.35)
+        right_present  = (self.lidar_right <= self.side_dist_thr)
 
-        if front_blocked:
-            # Direct dead-end ahead -> turn left in place to clear path
-            self._publish(0.0, self.angular_speed)
+        # ── STATE 1: INNER CORNER (کنج بسته) ──
+        # If front hits an obstacle, lock into in_corner_turn until robot turns completely away
+        if front_obstacle:
+            self.in_corner_turn = True
 
-        elif front_right_blocked and self.lidar_front_right < 0.22:
-            # Corner obstacle is very close -> curve left smoothly while moving forward
-            self._publish(self.wall_speed * 0.5, self.angular_speed * 0.8)
+        if self.in_corner_turn:
+            if front_cleared:
+                # Path ahead is fully open now -> unlock and return to tracking
+                self.in_corner_turn = False
+            else:
+                # MUST NOT move forward! Turn in place to the left smoothly
+                self._publish(0.0, self.angular_speed * 0.9)
+                return
 
-        elif not right_present:
-            # Lost wall on right -> curve right gently forward to re-acquire wall
-            self._publish(self.wall_speed * 0.8, -self.angular_speed * 0.5)
+        # ── STATE 2: WALL DISAPPEARED / OUTER CORNER (ناپدید شدن دیوار) ──
+        if not right_present:
+            # Wall ended or robot passed outer corner.
+            # Drive forward and curve right to wrap around the corner
+            self._publish(self.wall_speed * 0.7, -self.angular_speed * 0.6)
+            return
 
+        # ── STATE 3: STRAIGHT WALL TRACKING (حرکت موازی و صاف کنار دیوار) ──
+        # Distance error relative to target (0.21m = ~5cm body distance)
+        dist_error = self.lidar_right - self.desired_wall_dist
+
+        # Deadband (+/- 1.5 cm): if within 19.5cm to 22.5cm, do NOT steer, drive straight!
+        if abs(dist_error) < 0.015:
+            self._publish(self.wall_speed, 0.0)
         else:
-            # Normal wall tracking: proportional steering to maintain target distance
-            # Error = current distance - desired distance (0.21m)
-            # If error > 0 (too far) -> steer right (negative angular)
-            # If error < 0 (too close) -> steer left (positive angular)
-            dist_error = self.lidar_right - self.desired_wall_dist
-            kp = 2.0
+            # Smooth proportional correction without violent oscillations
+            # If too far (dist_error > 0) -> turn right (ang < 0)
+            # If too close (dist_error < 0) -> turn left (ang > 0)
+            kp = 1.6
             ang = -kp * dist_error
-            ang = max(-self.angular_speed * 0.7, min(self.angular_speed * 0.7, ang))
-
+            # Clamp angular speed to keep it gentle
+            ang = max(-self.angular_speed * 0.5, min(self.angular_speed * 0.5, ang))
             self._publish(self.wall_speed, ang)
 
     # ── Periodic telemetry ────────────────────────────────────────────────────
