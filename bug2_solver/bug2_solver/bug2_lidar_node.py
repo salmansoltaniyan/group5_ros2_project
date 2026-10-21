@@ -97,12 +97,12 @@ class Bug2LidarNode(Node):
         self.declare_parameter('angular_speed',         0.50, flex)
 
         # LiDAR distance thresholds tuned for ~5cm body clearance from walls:
-        # - Front:  LiDAR is 20cm from front edge -> 0.26m gives ~6cm clearance from front bumper
-        # - Corner: LiDAR is ~25.6cm diagonally  -> 0.31m gives ~5cm clearance from front-right corner
-        # - Side:   LiDAR is 16cm from side edge  -> 0.21m keeps robot body ~5cm away from right wall
-        self.declare_parameter('front_dist_threshold',  0.26, flex)
-        self.declare_parameter('corner_dist_threshold', 0.31, flex)
-        self.declare_parameter('side_dist_threshold',   0.35, flex)
+        # - Front: narrow cone straight ahead (-15° to +15°) -> 0.25m
+        # - Corner: diagonal check (-45° to -15°) -> 0.25m
+        # - Side: right wall detection (-110° to -70°) -> target 0.21m
+        self.declare_parameter('front_dist_threshold',  0.24, flex)
+        self.declare_parameter('corner_dist_threshold', 0.25, flex)
+        self.declare_parameter('side_dist_threshold',   0.40, flex)
         self.declare_parameter('desired_wall_dist',     0.21, flex)
 
         # Navigation tolerances
@@ -211,12 +211,12 @@ class Bug2LidarNode(Node):
         # Pre-compute angle for each ray (once per scan)
         # Sectors: accumulate min valid range per sector
         sectors = {
-            'front':       float('inf'),   # -30° to +30°
-            'front_right': float('inf'),   # -70° to -30°
-            'right':       float('inf'),   # -120° to -70°
-            'rear_right':  float('inf'),   # -160° to -120°
-            'front_left':  float('inf'),   # +30° to +70°
-            'left':        float('inf'),   # +70° to +120°
+            'front':       float('inf'),   # -15° to +15° (Narrow corridor directly in front)
+            'front_right': float('inf'),   # -50° to -15° (Diagonal corner)
+            'right':       float('inf'),   # -110° to -70° (Perpendicular right wall)
+            'rear_right':  float('inf'),   # -160° to -120° (Rear alignment check)
+            'front_left':  float('inf'),   # +15° to +50°
+            'left':        float('inf'),   # +70° to +110°
         }
 
         for i in range(n):
@@ -233,17 +233,17 @@ class Bug2LidarNode(Node):
                 angle_deg += 360.0
 
             # Classify into sector
-            if   -30.0 <= angle_deg <= 30.0:
+            if   -15.0 <= angle_deg <= 15.0:
                 sectors['front']       = min(sectors['front'], r)
-            if   -70.0 <= angle_deg < -30.0:
+            if   -50.0 <= angle_deg < -15.0:
                 sectors['front_right'] = min(sectors['front_right'], r)
-            if  -120.0 <= angle_deg < -70.0:
+            if  -110.0 <= angle_deg < -70.0:
                 sectors['right']       = min(sectors['right'], r)
             if  -160.0 <= angle_deg < -120.0:
                 sectors['rear_right']  = min(sectors['rear_right'], r)
-            if    30.0 <  angle_deg <= 70.0:
+            if    15.0 <  angle_deg <= 50.0:
                 sectors['front_left']  = min(sectors['front_left'], r)
-            if    70.0 <  angle_deg <= 120.0:
+            if    70.0 <  angle_deg <= 110.0:
                 sectors['left']        = min(sectors['left'], r)
 
         self.lidar_front       = sectors['front']
@@ -406,48 +406,32 @@ class Bug2LidarNode(Node):
                     f'dist_to_goal={d:.2f} m  →  GO_TO_GOAL')
                 return
 
-        # 4. Right-hand wall-follow logic (6-sector)
+        # 4. Smooth Right-hand wall-follow logic
         front_blocked       = self.lidar_front       <= self.front_dist_thr
         front_right_blocked = self.lidar_front_right <= self.corner_dist_thr
         right_present       = self.lidar_right        <= self.side_dist_thr
-        rear_right_present  = self.lidar_rear_right   <= self.side_dist_thr
 
-        if front_blocked or front_right_blocked:
-            # ── CASE 1: Wall ahead or corner blocked → turn LEFT
-            # If extremely close in front (< 0.22m), turn in place; otherwise turn while creeping
-            if self.lidar_front < 0.22 or self.lidar_front_right < 0.25:
-                self._publish(0.0, self.angular_speed)
-            else:
-                self._publish(self.wall_speed * 0.3, self.angular_speed)
+        if front_blocked:
+            # Direct dead-end ahead -> turn left in place to clear path
+            self._publish(0.0, self.angular_speed)
 
-        elif not right_present and not rear_right_present:
-            # ── CASE 2: Lost right wall completely → curve gently to right
-            self._publish(self.wall_speed * 0.7, -self.angular_speed * 0.4)
+        elif front_right_blocked and self.lidar_front_right < 0.22:
+            # Corner obstacle is very close -> curve left smoothly while moving forward
+            self._publish(self.wall_speed * 0.5, self.angular_speed * 0.8)
 
-        elif not right_present and rear_right_present:
-            # ── CASE 3: Outer corner (wall ended on side, still visible behind)
-            self._publish(self.wall_speed * 0.5, -self.angular_speed * 0.5)
+        elif not right_present:
+            # Lost wall on right -> curve right gently forward to re-acquire wall
+            self._publish(self.wall_speed * 0.8, -self.angular_speed * 0.5)
 
         else:
-            # ── CASE 4: Wall on right → Stable PD distance & heading control
-            # Distance error: positive means too far from wall
+            # Normal wall tracking: proportional steering to maintain target distance
+            # Error = current distance - desired distance (0.21m)
+            # If error > 0 (too far) -> steer right (negative angular)
+            # If error < 0 (too close) -> steer left (positive angular)
             dist_error = self.lidar_right - self.desired_wall_dist
-
-            # Alignment error: difference between rear and right sensor
-            # If rear > right, robot is pitched pointing into the wall
-            if math.isfinite(self.lidar_rear_right) and self.lidar_rear_right < self.side_dist_thr:
-                align_error = self.lidar_rear_right - self.lidar_right
-            else:
-                align_error = 0.0
-
-            # Correct sign convention for ROS standard (ang > 0 is CCW / Left, ang < 0 is CW / Right):
-            # - When dist_error > 0 (too far), turn RIGHT (ang < 0)
-            # - When dist_error < 0 (too close), turn LEFT (ang > 0)
-            # - When align_error > 0 (heading into wall), turn LEFT (ang > 0) to align parallel
-            kp_dist = 2.2
-            kp_align = 1.5
-            ang = -kp_dist * dist_error + kp_align * align_error
-            ang = max(-self.angular_speed, min(self.angular_speed, ang))
+            kp = 2.0
+            ang = -kp * dist_error
+            ang = max(-self.angular_speed * 0.7, min(self.angular_speed * 0.7, ang))
 
             self._publish(self.wall_speed, ang)
 
