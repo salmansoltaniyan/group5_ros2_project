@@ -111,7 +111,7 @@ class Bug2Node(Node):
         self.declare_parameter('angular_speed',         0.50, float_or_int)
 
         # IR thresholds  (raw ADC counts; typical range 0–200+ in open air, 400+ near wall)
-        self.declare_parameter('front_ir_threshold',    150,  float_or_int)
+        self.declare_parameter('front_ir_threshold',    450,  float_or_int)   # Increased from 150 to allow getting closer to wall
         self.declare_parameter('side_ir_threshold',     80,   float_or_int)
         self.declare_parameter('desired_side_ir',       120,  float_or_int)
 

@@ -68,6 +68,8 @@ def generate_launch_description():
                               description='Wall-following speed (m/s)'),
         DeclareLaunchArgument('angular_speed',         default_value='0.50',
                               description='Turn speed (rad/s)'),
+        DeclareLaunchArgument('front_ir_threshold',    default_value='450',
+                              description='IR reading threshold to detect a front wall (higher = closer to wall)'),
         # ── Bug2 leave-condition tuning ───────────────────────────────────────
         # m_line_tolerance:      perpendicular band around M-line that counts as "on the line"
         #                        Wider → easier to detect M-line crossing after obstacle
@@ -101,6 +103,7 @@ def generate_launch_description():
             'linear_speed':          LaunchConfiguration('linear_speed'),
             'wall_speed':            LaunchConfiguration('wall_speed'),
             'angular_speed':         LaunchConfiguration('angular_speed'),
+            'front_ir_threshold':    LaunchConfiguration('front_ir_threshold'),
             'm_line_tolerance':      LaunchConfiguration('m_line_tolerance'),
             'leave_progress_margin': LaunchConfiguration('leave_progress_margin'),
             'min_hit_clearance':     LaunchConfiguration('min_hit_clearance'),
