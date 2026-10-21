@@ -4,39 +4,41 @@
 Bug2 Navigator (LiDAR variant) for iRobot Create 3  -  ROS 2 Jazzy
 ================================================================================
 
-Identical to bug2_node.py (IR version) but uses 2D LiDAR (/scan) instead of
-IR sensors for obstacle detection and wall following.
+Uses 2D LiDAR (/scan) for obstacle detection and wall following.
+Odometry for position tracking and Bug2 M-line logic.
 
-Inputs:
-  - goal_x, goal_y  : distance (meters) from the START position to the goal
-  - /robot_9/scan          : sensor_msgs/msg/LaserScan    (wall detection)
-  - /robot_9/odom          : nav_msgs/msg/Odometry        (position)
+ROBOT BODY & LiDAR PLACEMENT
+-----------------------------
+  Robot chassis: 34 cm × 34 cm (square)
+  LiDAR offset from body edges:
+    Front: 20 cm    Back: 14 cm    Left/Right: 16 cm each
+  Diagonal LiDAR → front-right corner: √(20² + 16²) ≈ 25.6 cm
 
-Output:
-  - /robot_9/cmd_vel       : geometry_msgs/msg/Twist
+  All distance thresholds are measured FROM THE LiDAR, not from the robot edge.
+  When tuning, remember to add ~20 cm for front clearance, ~16 cm for side clearance.
 
-LiDAR REGIONS (degrees from front, counter-clockwise positive):
-  - Front  :  -20° to  +20°    (0° = straight ahead)
-  - Right  : -100° to  -40°
-  - Left   :  +40° to +100°
+LiDAR SECTORS (6 regions, 0° = straight ahead, CCW positive)
+─────────────────────────────────────────────────────────────
 
-  Each region takes the MINIMUM valid range reading.
-  Readings below range_min or above range_max are filtered out.
+                          FRONT
+                      -30° to +30°
+                        ╲  ↑  ╱
+            FRONT_LEFT   ╲ | ╱   FRONT_RIGHT
+            +30° to +70°  ╲|╱    -70° to -30°
+                ──────────[●]──────────
+            LEFT         ╱|╲          RIGHT
+            +70° to +120°╱ | ╲        -120° to -70°
+                        ╱  |  ╲
+            REAR_LEFT  ╱   |   ╲  REAR_RIGHT
+            +120°-160°╱    ↓    ╲ -160° to -120°
 
-TUNING (params you can change)
---------------------------------
-  goal_x, goal_y            : target offset from start (meters)
-  namespace                 : robot namespace  (default: robot_9)
-  linear_speed              : forward speed    (default: 0.15 m/s)
-  wall_speed                : speed along wall (default: 0.12 m/s)
-  angular_speed             : turn speed       (default: 0.5  rad/s)
-  front_dist_threshold      : front obstacle distance (default: 0.35 m)
-  side_dist_threshold       : max distance to count as "wall on side" (default: 0.50 m)
-  desired_wall_dist         : target wall distance for proportional control (default: 0.25 m)
-  goal_tolerance            : arrival radius   (default: 0.15 m)
-  m_line_tolerance          : band to detect M-line crossing (default: 0.15 m)
-  leave_progress_margin     : must be this much closer than H to leave (default: 0.02 m)
-  min_hit_clearance         : minimum distance to travel from H before checking leave
+  Each sector reports its MINIMUM valid range reading.
+
+  Key sectors for right-hand wall following:
+    FRONT        → obstacle avoidance (stop & turn left)
+    FRONT_RIGHT  → CORNER PROTECTION (prevents diagonal collisions)
+    RIGHT        → wall tracking (proportional distance control)
+    REAR_RIGHT   → outer corner detection (wall ending behind robot)
 ================================================================================
 """
 
@@ -85,7 +87,6 @@ class Bug2LidarNode(Node):
         # ── Parameters ────────────────────────────────────────────────────────
         self.declare_parameter('namespace',             'robot_9')
 
-        # Allow dynamic typing (float or int) for coordinates and tolerances
         flex = ParameterDescriptor(dynamic_typing=True)
         self.declare_parameter('goal_x',                2.0,  flex)
         self.declare_parameter('goal_y',                0.0,  flex)
@@ -95,10 +96,14 @@ class Bug2LidarNode(Node):
         self.declare_parameter('wall_speed',            0.12, flex)
         self.declare_parameter('angular_speed',         0.50, flex)
 
-        # LiDAR distance thresholds (meters)
-        self.declare_parameter('front_dist_threshold',  0.35, flex)  # obstacle in front
-        self.declare_parameter('side_dist_threshold',   0.50, flex)  # "wall detected on side"
-        self.declare_parameter('desired_wall_dist',     0.25, flex)  # target distance to right wall
+        # LiDAR distance thresholds tuned for ~5cm body clearance from walls:
+        # - Front:  LiDAR is 20cm from front edge -> 0.26m gives ~6cm clearance from front bumper
+        # - Corner: LiDAR is ~25.6cm diagonally  -> 0.31m gives ~5cm clearance from front-right corner
+        # - Side:   LiDAR is 16cm from side edge  -> 0.21m keeps robot body ~5cm away from right wall
+        self.declare_parameter('front_dist_threshold',  0.26, flex)
+        self.declare_parameter('corner_dist_threshold', 0.31, flex)
+        self.declare_parameter('side_dist_threshold',   0.35, flex)
+        self.declare_parameter('desired_wall_dist',     0.21, flex)
 
         # Navigation tolerances
         self.declare_parameter('goal_tolerance',        0.15, flex)
@@ -114,6 +119,7 @@ class Bug2LidarNode(Node):
         self.wall_speed           = float(self.get_parameter('wall_speed').value)
         self.angular_speed        = float(self.get_parameter('angular_speed').value)
         self.front_dist_thr       = float(self.get_parameter('front_dist_threshold').value)
+        self.corner_dist_thr      = float(self.get_parameter('corner_dist_threshold').value)
         self.side_dist_thr        = float(self.get_parameter('side_dist_threshold').value)
         self.desired_wall_dist    = float(self.get_parameter('desired_wall_dist').value)
         self.goal_tolerance       = float(self.get_parameter('goal_tolerance').value)
@@ -144,10 +150,13 @@ class Bug2LidarNode(Node):
         self.hit_dist_to_goal      = float('inf')
         self.hit_clearance_ok      = False
 
-        # LiDAR region distances (meters, inf = nothing detected)
-        self.lidar_front = float('inf')
-        self.lidar_right = float('inf')
-        self.lidar_left  = float('inf')
+        # LiDAR 6-sector distances (meters, inf = nothing detected)
+        self.lidar_front       = float('inf')   # -30° to +30°
+        self.lidar_front_right = float('inf')   # -70° to -30°
+        self.lidar_right       = float('inf')   # -120° to -70°
+        self.lidar_rear_right  = float('inf')   # -160° to -120°
+        self.lidar_front_left  = float('inf')   # +30° to +70°
+        self.lidar_left        = float('inf')   # +70° to +120°
 
         # ── ROS 2 interfaces ──────────────────────────────────────────────────
         sensor_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -174,11 +183,11 @@ class Bug2LidarNode(Node):
         self.create_timer(1.00, self._log_status)
 
         self.get_logger().info('=' * 60)
-        self.get_logger().info('  Bug2 Navigator (LiDAR)  —  Waiting for first odometry ...')
+        self.get_logger().info('  Bug2 Navigator (LiDAR, 6-sector)')
         self.get_logger().info(f'  Goal offset: dx={self.goal_dx:.2f} m  dy={self.goal_dy:.2f} m')
-        self.get_logger().info(f'  Front threshold: {self.front_dist_thr:.2f} m')
-        self.get_logger().info(f'  Side  threshold: {self.side_dist_thr:.2f} m')
-        self.get_logger().info(f'  Desired wall dist: {self.desired_wall_dist:.2f} m')
+        self.get_logger().info(f'  Front thr: {self.front_dist_thr:.2f}m  Corner thr: {self.corner_dist_thr:.2f}m')
+        self.get_logger().info(f'  Side  thr: {self.side_dist_thr:.2f}m  Desired wall: {self.desired_wall_dist:.2f}m')
+        self.get_logger().info('  Waiting for first odometry ...')
         self.get_logger().info('=' * 60)
 
     # ── Subscriber callbacks ──────────────────────────────────────────────────
@@ -194,32 +203,56 @@ class Bug2LidarNode(Node):
             self._record_start()
 
     def _scan_cb(self, msg: LaserScan):
-        """Extract front / right / left minimum distances from LaserScan."""
+        """Extract 6-sector minimum distances from LaserScan."""
         n = len(msg.ranges)
         if n == 0:
             return
 
-        def _min_range_in_sector(angle_min_deg, angle_max_deg):
-            """Return the minimum valid range in the given angular sector."""
-            best = float('inf')
-            for i in range(n):
-                angle_rad = msg.angle_min + i * msg.angle_increment
-                angle_deg = math.degrees(angle_rad)
-                # Normalise to -180..+180
-                while angle_deg > 180.0:
-                    angle_deg -= 360.0
-                while angle_deg < -180.0:
-                    angle_deg += 360.0
-                if angle_min_deg <= angle_deg <= angle_max_deg:
-                    r = msg.ranges[i]
-                    if msg.range_min <= r <= msg.range_max and math.isfinite(r):
-                        best = min(best, r)
-            return best
+        # Pre-compute angle for each ray (once per scan)
+        # Sectors: accumulate min valid range per sector
+        sectors = {
+            'front':       float('inf'),   # -30° to +30°
+            'front_right': float('inf'),   # -70° to -30°
+            'right':       float('inf'),   # -120° to -70°
+            'rear_right':  float('inf'),   # -160° to -120°
+            'front_left':  float('inf'),   # +30° to +70°
+            'left':        float('inf'),   # +70° to +120°
+        }
 
-        self.lidar_front = _min_range_in_sector(-20.0,  20.0)
-        self.lidar_right = _min_range_in_sector(-100.0, -40.0)
-        self.lidar_left  = _min_range_in_sector( 40.0,  100.0)
-        self.scan_ready  = True
+        for i in range(n):
+            r = msg.ranges[i]
+            if not (msg.range_min <= r <= msg.range_max and math.isfinite(r)):
+                continue
+
+            angle_rad = msg.angle_min + i * msg.angle_increment
+            angle_deg = math.degrees(angle_rad)
+            # Normalise to -180..+180
+            while angle_deg > 180.0:
+                angle_deg -= 360.0
+            while angle_deg < -180.0:
+                angle_deg += 360.0
+
+            # Classify into sector
+            if   -30.0 <= angle_deg <= 30.0:
+                sectors['front']       = min(sectors['front'], r)
+            if   -70.0 <= angle_deg < -30.0:
+                sectors['front_right'] = min(sectors['front_right'], r)
+            if  -120.0 <= angle_deg < -70.0:
+                sectors['right']       = min(sectors['right'], r)
+            if  -160.0 <= angle_deg < -120.0:
+                sectors['rear_right']  = min(sectors['rear_right'], r)
+            if    30.0 <  angle_deg <= 70.0:
+                sectors['front_left']  = min(sectors['front_left'], r)
+            if    70.0 <  angle_deg <= 120.0:
+                sectors['left']        = min(sectors['left'], r)
+
+        self.lidar_front       = sectors['front']
+        self.lidar_front_right = sectors['front_right']
+        self.lidar_right       = sectors['right']
+        self.lidar_rear_right  = sectors['rear_right']
+        self.lidar_front_left  = sectors['front_left']
+        self.lidar_left        = sectors['left']
+        self.scan_ready        = True
 
     # ── Initialisation ────────────────────────────────────────────────────────
 
@@ -321,10 +354,11 @@ class Bug2LidarNode(Node):
             self.goal_x - self.curr_x)
         err = _angle_diff(angle_to_goal, self.curr_yaw)
 
-        # Obstacle in front? Check only when reasonably facing the goal direction
-        if abs(err) <= 0.60 and self.lidar_front <= self.front_dist_thr:
-            self._enter_wall_follow()
-            return
+        # Obstacle check: front OR front-right diagonal (only when roughly facing goal)
+        if abs(err) <= 0.60:
+            if self.lidar_front <= self.front_dist_thr or self.lidar_front_right <= self.corner_dist_thr:
+                self._enter_wall_follow()
+                return
 
         if abs(err) > 0.30:          # > ~17° → turn in place
             self._publish(0.0, self.angular_speed * (1.0 if err > 0 else -1.0))
@@ -344,7 +378,7 @@ class Bug2LidarNode(Node):
             f'[HIT]  ({self.hit_x:.2f}, {self.hit_y:.2f})  '
             f'dist_to_goal={self.hit_dist_to_goal:.2f} m  →  WALL_FOLLOW')
 
-    # ── WALL_FOLLOW behaviour (right-hand rule using LiDAR) ───────────────────
+    # ── WALL_FOLLOW behaviour (right-hand rule using LiDAR, 6-sector) ────────
 
     def _wall_follow(self):
         d = self._dist_to_goal()
@@ -372,22 +406,34 @@ class Bug2LidarNode(Node):
                     f'dist_to_goal={d:.2f} m  →  GO_TO_GOAL')
                 return
 
-        # 4. Right-hand wall-follow logic using LiDAR distances
-        front_blocked = self.lidar_front <= self.front_dist_thr
-        right_present = self.lidar_right <= self.side_dist_thr
+        # 4. Right-hand wall-follow logic (6-sector)
+        front_blocked       = self.lidar_front       <= self.front_dist_thr
+        front_right_blocked = self.lidar_front_right  <= self.corner_dist_thr
+        right_present       = self.lidar_right        <= self.side_dist_thr
+        rear_right_present  = self.lidar_rear_right   <= self.side_dist_thr
 
-        if front_blocked:
-            # Wall ahead → turn LEFT (counter-clockwise)
+        if front_blocked or front_right_blocked:
+            # ── CASE 1: Wall ahead or approaching corner → turn LEFT in place
             self._publish(0.0, self.angular_speed)
-        elif not right_present:
-            # Lost right wall → turn RIGHT gently to find it
-            self._publish(self.wall_speed * 0.7, -self.angular_speed * 0.6)
+
+        elif not right_present and not rear_right_present:
+            # ── CASE 2: Completely lost right wall → turn RIGHT to find it
+            #    Both right and rear-right are empty: open space on the right
+            #    Turn right more aggressively while moving slowly forward
+            self._publish(self.wall_speed * 0.5, -self.angular_speed * 0.7)
+
+        elif not right_present and rear_right_present:
+            # ── CASE 3: Outer corner — wall ending
+            #    Right is clear but rear-right still has a wall: robot is passing
+            #    the end of a wall. Go forward and turn right gently to wrap around.
+            self._publish(self.wall_speed, -self.angular_speed * 0.4)
+
         else:
-            # Wall on right → proportional control to maintain desired distance
-            # error > 0 means too far from wall  →  need to turn right (negative angular)
-            # error < 0 means too close to wall  →  need to turn left  (positive angular)
+            # ── CASE 4: Wall on right → proportional distance control
+            #    error > 0 → too far from wall  → turn right (negative angular)
+            #    error < 0 → too close to wall  → turn left  (positive angular)
             error = self.lidar_right - self.desired_wall_dist
-            kp = 2.0
+            kp = 2.5
             ang = kp * error
             ang = max(-self.angular_speed, min(self.angular_speed, ang))
             self._publish(self.wall_speed, ang)
@@ -401,7 +447,7 @@ class Bug2LidarNode(Node):
         d_ml  = self._dist_to_m_line() if self.state == WALL_FOLLOW else 0.0
         state = STATE_NAMES.get(self.state, '?')
 
-        def _fmt(v):
+        def _f(v):
             return f'{v:.2f}' if math.isfinite(v) else ' inf'
 
         self.get_logger().info(
@@ -409,7 +455,8 @@ class Bug2LidarNode(Node):
             f'pos=({self.curr_x:.2f},{self.curr_y:.2f})  '
             f'yaw={math.degrees(self.curr_yaw):5.1f}°  '
             f'dist_goal={d:.2f}m  '
-            f'LiDAR F={_fmt(self.lidar_front)} R={_fmt(self.lidar_right)} L={_fmt(self.lidar_left)}'
+            f'F={_f(self.lidar_front)} FR={_f(self.lidar_front_right)} '
+            f'R={_f(self.lidar_right)} RR={_f(self.lidar_rear_right)}'
             + (f'  M-line={d_ml:.3f}m' if self.state == WALL_FOLLOW else '')
         )
 
@@ -431,4 +478,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
