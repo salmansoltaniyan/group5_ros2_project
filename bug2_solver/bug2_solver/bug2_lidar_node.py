@@ -149,7 +149,13 @@ class Bug2LidarNode(Node):
         self.hit_x = self.hit_y   = 0.0
         self.hit_dist_to_goal      = float('inf')
         self.hit_clearance_ok      = False
-        self.in_corner_turn        = False  # Lock mode for inner-corner 90-degree turning
+        
+        # 90-degree discrete turn states for orthogonal maze
+        self.turn_in_progress      = False
+        self.target_turn_yaw       = 0.0
+        self.post_turn_drive_dist  = 0.0
+        self.post_turn_start_x     = 0.0
+        self.post_turn_start_y     = 0.0
 
         # LiDAR 6-sector distances (meters, inf = nothing detected)
         self.lidar_front       = float('inf')   # -30° to +30°
@@ -374,6 +380,7 @@ class Bug2LidarNode(Node):
         self.hit_y           = self.curr_y
         self.hit_dist_to_goal = self._dist_to_goal()
         self.hit_clearance_ok = False
+        self.turn_in_progress = False
         self.state           = WALL_FOLLOW
         self.get_logger().info(
             f'[HIT]  ({self.hit_x:.2f}, {self.hit_y:.2f})  '
@@ -407,51 +414,55 @@ class Bug2LidarNode(Node):
                     f'dist_to_goal={d:.2f} m  →  GO_TO_GOAL')
                 return
 
-        # ── 3-STATE WALL-FOLLOWING LOGIC ──────────────────────────────────────
-        # Front clearance safety: bumper is 20cm from LiDAR.
-        # Trigger turn when closer than 0.26m (~6cm clearance)
-        front_obstacle = (self.lidar_front < 0.26 or self.lidar_front_right < 0.25)
-        # Clear distance required to EXIT corner turn (corridor must open up to at least 40cm)
-        front_cleared  = (self.lidar_front > 0.40 and self.lidar_front_right > 0.35)
-        right_present  = (self.lidar_right <= self.side_dist_thr)
-
-        # ── STATE 1: INNER CORNER (کنج بسته) ──
-        # If front hits an obstacle, lock into in_corner_turn until robot turns completely away
-        if front_obstacle:
-            self.in_corner_turn = True
-
-        if self.in_corner_turn:
-            if front_cleared:
-                # Path ahead is fully open now -> unlock and return to tracking
-                self.in_corner_turn = False
+        # ── ORTHOGONAL MAZE WALL-FOLLOW (EXACT 90-DEGREE ROTATIONS) ───────────
+        
+        # 1. If currently executing an exact 90-degree turn in-place:
+        if self.turn_in_progress:
+            yaw_err = _angle_diff(self.target_turn_yaw, self.curr_yaw)
+            if abs(yaw_err) < 0.05:  # within ~3 degrees of target
+                # Turn completed! Stop turning and resume forward drive
+                self.turn_in_progress = False
+                self._stop()
             else:
-                # MUST NOT move forward! Turn in place to the left smoothly
-                self._publish(0.0, self.angular_speed * 0.9)
-                return
-
-        # ── STATE 2: WALL DISAPPEARED / OUTER CORNER (ناپدید شدن دیوار) ──
-        if not right_present:
-            # Wall ended or robot passed outer corner.
-            # Drive forward and curve right to wrap around the corner
-            self._publish(self.wall_speed * 0.7, -self.angular_speed * 0.6)
+                turn_dir = 1.0 if yaw_err > 0 else -1.0
+                turn_spd = max(0.20, min(self.angular_speed, abs(yaw_err) * 1.5))
+                self._publish(0.0, turn_spd * turn_dir)
             return
 
-        # ── STATE 3: STRAIGHT WALL TRACKING (حرکت موازی و صاف کنار دیوار) ──
-        # Distance error relative to target (0.21m = ~5cm body distance)
-        dist_error = self.lidar_right - self.desired_wall_dist
+        # 2. Check for front obstacle (Inner 90-degree Corner)
+        # Bumper is 20cm from LiDAR; trigger at 0.25m
+        if self.lidar_front < 0.25 or self.lidar_front_right < 0.24:
+            # Initiate EXACT 90-degree LEFT turn (+pi/2)
+            self.turn_in_progress = True
+            target_raw = self.curr_yaw + (math.pi / 2.0)
+            # Normalize to [-pi, pi]
+            self.target_turn_yaw = math.atan2(math.sin(target_raw), math.cos(target_raw))
+            self._publish(0.0, self.angular_speed)
+            return
 
-        # Deadband (+/- 1.5 cm): if within 19.5cm to 22.5cm, do NOT steer, drive straight!
-        if abs(dist_error) < 0.015:
+        # 3. Check for wall disappearance on the right (Outer 90-degree Corner)
+        right_wall_present = (self.lidar_right <= self.side_dist_thr)
+        if not right_wall_present:
+            # Wall ended! Creep slightly forward then initiate EXACT 90-degree RIGHT turn (-pi/2)
+            self.turn_in_progress = True
+            target_raw = self.curr_yaw - (math.pi / 2.0)
+            self.target_turn_yaw = math.atan2(math.sin(target_raw), math.cos(target_raw))
+            # First small nudge forward so wheels clear the edge, then turn right
+            self._publish(self.wall_speed * 0.4, -self.angular_speed)
+            return
+
+        # 4. Straight Wall Driving (Hallway Tracking)
+        # Target distance = desired_wall_dist (0.21m)
+        dist_err = self.lidar_right - self.desired_wall_dist
+        
+        if abs(dist_err) < 0.02:
+            # Perfectly aligned, drive straight without any angular wobble
             self._publish(self.wall_speed, 0.0)
         else:
-            # Smooth proportional correction without violent oscillations
-            # If too far (dist_error > 0) -> turn right (ang < 0)
-            # If too close (dist_error < 0) -> turn left (ang > 0)
-            kp = 1.6
-            ang = -kp * dist_error
-            # Clamp angular speed to keep it gentle
-            ang = max(-self.angular_speed * 0.5, min(self.angular_speed * 0.5, ang))
-            self._publish(self.wall_speed, ang)
+            # Minor micro-trimming to stay at 5cm distance
+            trim_ang = -1.2 * dist_err
+            trim_ang = max(-0.15, min(0.15, trim_ang))  # gentle micro-trim (max ~8 deg/s)
+            self._publish(self.wall_speed, trim_ang)
 
     # ── Periodic telemetry ────────────────────────────────────────────────────
 
