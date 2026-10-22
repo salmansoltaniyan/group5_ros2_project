@@ -1,0 +1,227 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{microtype}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!70!black,
+    citecolor=blue!70!black,
+    urlcolor=blue!70!black
+}
+
+% Code Listing Configuration
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.96,0.97,0.98}
+
+\lstdefinestyle{rosstyle}{
+    backgroundcolor=\color{backcolour},   
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{blue!80!black}\bfseries,
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,         
+    breaklines=true,                 
+    captionpos=b,                    
+    keepspaces=true,                 
+    numbers=left,                    
+    numbersep=6pt,                  
+    showspaces=false,                
+    showstringspaces=false,
+    showtabs=false,                  
+    tabsize=2,
+    frame=single,
+    rulecolor=\color{black!15}
+}
+\lstset{style=rosstyle}
+
+\title{\textbf{Distributed Bug2 Navigation Architecture\\for the iRobot Create 3 Platform in ROS 2 Jazzy}}
+\author{\textbf{Group 5} \\ 
+Master of Science in Sensor System Engineering / Robotics \\ 
+Hanze University of Applied Sciences, Groningen}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This report presents the design, mathematical modeling, and experimental deployment of an autonomous Bug2 maze solver on the iRobot Create 3 mobile robot using ROS 2 Jazzy Jalisco. Unlike monolithic implementations, this work establishes a distributed multi-node architecture utilizing custom asynchronous ROS 2 Action interfaces. A central coordinator manages the global state transitions along the canonical M-line, while dedicated action servers execute straight-line goal convergence and wall tracking. Furthermore, an interchangeable dual-backend wall follower is developed: (1) a custom 4-state 2D LiDAR controller with forward-arc convex cornering, and (2) an adapter node wrapping the Create 3 platform's internal infrared (IR) wall-following behavior tree. Both controllers achieve stable traversal through 90-degree orthogonal maze corridors while guaranteeing graceful preemption upon shutdown.
+\end{abstract}
+
+\section{Introduction}
+Autonomous navigation in unknown environments without prior geometric maps represents a foundational challenge in mobile robotics. The Bug algorithm family, pioneered by Lumelsky and Stepanov, provides provable guarantees of goal convergence or target unreachable identification using solely local obstacle sensing and global odometry. 
+
+The primary objective of this project is to develop, tune, and verify a distributed Bug2 navigation system on the iRobot Create 3 differential-drive platform operating under ROS 2 Jazzy Jalisco. Rather than relying on a single monolithic node, the system is architected as an asynchronous network of action servers coordinated by a supervisory finite-state machine.
+
+\section{Mathematical Formulation of Bug2}
+
+\subsection{The M-Line Equation}
+The Bug2 algorithm relies on an imaginary straight reference line, termed the \textbf{M-line} (Main line), which permanently connects the initial start position $S(x_s, y_s)$ to the global target $G(x_g, y_g)$. 
+
+Let:
+\begin{align}
+\Delta x &= x_g - x_s \\
+\Delta y &= y_g - y_s
+\end{align}
+
+The general implicit equation of the M-line is defined as:
+\begin{equation}
+A \cdot x + B \cdot y + C = 0
+\end{equation}
+where the coefficients are given by:
+\begin{equation}
+A = -\Delta y, \quad B = \Delta x, \quad C = \Delta y \cdot x_s - \Delta x \cdot y_s
+\end{equation}
+
+For any instantaneous robot pose $P_r(x_r, y_r)$, the perpendicular Euclidean distance to the M-line is computed continuously as:
+\begin{equation}
+d_{m\_line}(P_r) = \frac{|A \cdot x_r + B \cdot y_r + C|}{\sqrt{A^2 + B^2}}
+\end{equation}
+
+\subsection{Hit and Leave Conditions}
+The transition logic between direct goal navigation and boundary following is governed by strict mathematical conditions:
+
+\begin{enumerate}
+    \item \textbf{Hit Point Registration ($H_i$):} When navigating towards the goal, if a front obstacle is detected within clearance threshold ($d_{front} \le d_{thr}$), the robot halts and records the current pose as the $i$-th hit point $H_i(x_h, y_h)$. The Euclidean distance to the goal at impact is:
+    \begin{equation}
+    d_{hit\_goal} = \sqrt{(x_g - x_h)^2 + (y_g - y_h)^2}
+    \end{equation}
+
+    \item \textbf{Hit-Clearance Condition:} To prevent the robot from prematurely leaving the wall at the immediate vicinity of the hit point, the leave logic is gated until:
+    \begin{equation}
+    \sqrt{(x_r - x_h)^2 + (y_r - y_h)^2} \ge d_{clearance\_min} \quad (\text{configured to } 0.30\text{ m})
+    \end{equation}
+
+    \item \textbf{Leave Point Verification ($L_i$):} Once hit clearance is satisfied, the robot leaves boundary following and transitions back to \texttt{GoToGoal} if and only if:
+    \begin{equation}
+    d_{m\_line}(P_r) \le \epsilon_{m\_line} \quad \land \quad d_{goal}(P_r) \le d_{hit\_goal} - \delta_{progress}
+    \end{equation}
+    where $\epsilon_{m\_line} = 0.15\text{ m}$ is the corridor tolerance and $\delta_{progress} = 0.02\text{ m}$ ensures monotonic progress toward the destination.
+\end{enumerate}
+
+\section{Distributed System Architecture}
+
+\subsection{Node Decomposition}
+The software architecture is partitioned into four modular nodes across two packages:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{\texttt{bug2\_coordinator}:} Central Action Client and Finite State Machine. Translates user-specified local goal offsets into world coordinates, records initial odometry, and schedules action execution.
+    \item \textbf{\texttt{go_to_goal_server}:} Action Server for \texttt{/go_to_goal}. Directs the robot along the heading error vector toward $G$ and monitors front LiDAR sectors for obstacles.
+    \item \textbf{\texttt{wall_follow_server}:} Action Server for \texttt{/wall_follow}. Implements custom 2D LiDAR wall tracking calibrated for orthogonal maze walls.
+    \item \textbf{\texttt{wall_follow_ir_server}:} Action Server for \texttt{/wall_follow}. Acts as an Adapter, wrapping the Create 3 platform's native internal IR wall follower while evaluating Bug2 M-line leave conditions.
+\end{itemize}
+
+\subsection{Custom Action Definitions (\texttt{create3_interfaces})}
+Two custom ROS 2 Action interfaces were designed to facilitate non-blocking client-server execution:
+
+\begin{lstlisting}[language=Python, caption=GoToGoal.action]
+# Goal
+geometry_msgs/Point target_point
+---
+# Result
+bool reached_goal
+bool obstacle_detected
+geometry_msgs/Point hit_point
+string message
+---
+# Feedback
+float64 distance_to_target
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python, caption=Bug2WallFollow.action]
+# Goal
+geometry_msgs/Point start_point
+geometry_msgs/Point target_point
+geometry_msgs/Point hit_point
+int8 follow_side               # -1: Right wall, +1: Left wall
+---
+# Result
+bool success
+string message
+---
+# Feedback
+float64 distance_to_m_line
+float64 distance_to_target
+\end{lstlisting}
+
+\section{Wall-Following Strategies \& Control Design}
+
+\subsection{Strategy 1: 2D LiDAR 4-State Controller}
+The Create 3 round chassis has a diameter of $34\text{ cm}$. The 2D LiDAR is mounted $20\text{ cm}$ behind the front bumper and $16\text{ cm}$ from the lateral body edges. To maintain a strict $5\text{ cm}$ body-to-wall clearance, the target LiDAR lateral distance is set to $d_{desired} = 0.21\text{ m}$.
+
+To solve the dead-end and outer corner dilemma in orthogonal mazes, a deterministic 4-state controller was developed:
+
+\begin{table}[h!]
+\centering
+\caption{2D LiDAR 4-State Wall-Following Logic}
+\label{tab:lidar_states}
+\begin{tabular}{lll}
+\toprule
+\textbf{Condition} & \textbf{Physical Scenario} & \textbf{Control Output} \\
+\midrule
+$d_{front} < 0.28\text{m} \lor d_{front\_right} < 0.28\text{m}$ & Inner Corner / Dead End & In-place counter-clockwise spin ($v=0, \omega=+0.50$) \\
+$d_{right} < 0.18\text{m}$ & Too close to right wall & Creep forward, steer left ($v=0.12, \omega=+0.25$) \\
+$d_{right} > 0.26\text{m}$ & Outer Corner (Wall ended) & \textbf{Forward-arc turn} ($v=0.096, \omega=-0.35$) \\
+$0.18\text{m} \le d_{right} \le 0.26\text{m}$ & Nominal Sweet Spot & Drive straight forward ($v=0.12, \omega=0.0$) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{Critical Finding on Convex Corners:} Standard pure in-place rotation at outer corners causes the robot's center of mass to remain stationary, failing to sweep the sensor cone around the corner and inducing endless $360^\circ$ spins. Enabling simultaneous forward velocity ($v = 0.096\text{ m/s}$) during clockwise rotation allows the robot to trace a smooth trajectory around outer corners, maintaining constant wall contact.
+
+\subsection{Strategy 2: Create 3 Native IR Adapter Pattern}
+The iRobot Create 3 features built-in IR wall and cliff sensors driven by platform-level firmware. However, its native action server (\texttt{/{ns}/wall\_follow}) possesses no awareness of Bug2 leave points or goal coordinates. 
+
+The developed \texttt{wall\_follow\_ir\_server} bridges this gap by acting simultaneously as:
+\begin{enumerate}
+    \item An \textbf{Action Server} providing \texttt{Bug2WallFollow} to the coordinator.
+    \item An \textbf{Action Client} commanding Create 3's native \texttt{irobot_create_msgs/action/WallFollow}.
+\end{enumerate}
+The adapter monitors platform odometry at $10\text{ Hz}$. Upon detecting a valid leave point, it immediately transmits an asynchronous cancel request to the underlying firmware action and halts the platform with a burst of zero-twist commands.
+
+\section{Safety \& Graceful Preemption}
+In multi-node ROS 2 systems, issuing \texttt{Ctrl+C} typically terminates high-level Python processes while leaving platform-level firmware executing prior trajectories. To eliminate runaway behavior:
+\begin{itemize}
+    \item All action servers and the coordinator implement unified signal traps.
+    \item Active goal handles on Create 3 firmware are systematically preempted via \texttt{cancel\_goal\_async()} within \texttt{finally} blocks.
+    \item Zero-velocity bursts ($5 \times \text{Twist}(0, 0)$ at $50\text{ Hz}$) are published directly to \texttt{cmd\_vel} to counter dropped DDS packets upon process teardown.
+\end{itemize}
+
+\section{Execution and Verification}
+
+\subsection{Building the Workspace}
+\begin{lstlisting}[language=bash]
+cd ~/icreate3_ws
+colcon build --packages-select create3_interfaces bug2_distributed
+source install/setup.bash
+\end{lstlisting}
+
+\subsection{Launch Commands}
+Switching between LiDAR and IR backends is achieved via a single launch argument:
+
+\begin{lstlisting}[language=bash]
+# Option A: Autonomous traversal via 2D LiDAR (4-State Controller)
+ros2 launch bug2_distributed bug2_distributed_launch.py wall_follow_type:=lidar goal_x:=2.0 goal_y:=0.0
+
+# Option B: Autonomous traversal via native IR Sensors (Adapter Pattern)
+ros2 launch bug2_distributed bug2_distributed_launch.py wall_follow_type:=ir goal_x:=2.0 goal_y:=0.0
+\end{lstlisting}
+
+\section{Conclusion}
+This project successfully designed, implemented, and experimentally validated a distributed Bug2 navigation architecture for the iRobot Create 3 under ROS 2 Jazzy. The modular action-based structure separates high-level planning from low-level motion control, while the dual-backend architecture enables seamless runtime switching between 2D LiDAR and platform IR sensors. Experimental trials verified reliable orthogonal maze solving, collision avoidance with $5\text{ cm}$ body clearance, and clean operational safety on process shutdown.
+
+\end{document}
+
