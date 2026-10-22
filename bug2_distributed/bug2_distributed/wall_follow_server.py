@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-WallFollow Action Server for iRobot Create 3 - ROS 2 Jazzy
+WallFollow Action Server (2D LiDAR Backend) for iRobot Create 3 - ROS 2 Jazzy
 ================================================================================
 Node: wall_follow_server
 Action: /wall_follow (create3_interfaces/action/Bug2WallFollow)
 
 Role in Bug2 Architecture:
-- Tracks the obstacle wall using 2D LiDAR (right-hand rule).
-- Receives start_point, target_point, and hit_point.
-- Computes M-line equation and monitors leave condition.
-- Executes Stop-at-Corner + PD on straight walls.
-- Returns result.success = True when a valid Bug2 leave point is reached.
+- Tracks obstacle boundary on the right side using 2D LaserScan rays.
+- Receives start_point, target_point, and hit_point from bug2_coordinator.
+- Formulates the global M-line equation and monitors Euclidean distance to it.
+- Employs a deterministic 4-state controller with forward-arc convex cornering.
+- Returns result.success = True once a valid Bug2 leave point is reached.
 ================================================================================
 """
 
+# ==============================================================================
+# BLOCK 1: Imports & Mathematical Helper Functions
+# ==============================================================================
 import math
 import time
 import rclpy
@@ -33,12 +36,14 @@ from create3_interfaces.action import Bug2WallFollow
 
 
 def _yaw_from_quaternion(q):
+    """Extract yaw angle (rotation around Z axis) from ROS orientation quaternion."""
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny_cosp, cosy_cosp)
 
 
 def _angle_diff(a, b):
+    """Compute the shortest angular difference (a - b) normalized to [-pi, +pi]."""
     d = a - b
     while d > math.pi:
         d -= 2.0 * math.pi
@@ -47,6 +52,9 @@ def _angle_diff(a, b):
     return d
 
 
+# ==============================================================================
+# BLOCK 2: Node Class Definition & Parameter Declaration
+# ==============================================================================
 class WallFollowServer(Node):
     def __init__(self):
         super().__init__('wall_follow_server')
@@ -58,11 +66,13 @@ class WallFollowServer(Node):
         self.declare_parameter('kp_wall',               1.8,  flex)
         self.declare_parameter('kd_wall',               0.6,  flex)
 
+        # Distance thresholds for Create 3 geometry (34cm round chassis, 5cm body clearance)
         self.declare_parameter('front_dist_threshold',  0.26, flex)
         self.declare_parameter('corner_dist_threshold', 0.25, flex)
         self.declare_parameter('side_dist_threshold',   0.32, flex)
         self.declare_parameter('desired_wall_dist',     0.21, flex)
 
+        # Bug2 leave condition tolerances
         self.declare_parameter('goal_tolerance',        0.15, flex)
         self.declare_parameter('m_line_tolerance',      0.15, flex)
         self.declare_parameter('leave_progress_margin', 0.02, flex)
@@ -82,10 +92,12 @@ class WallFollowServer(Node):
         self.leave_margin         = float(self.get_parameter('leave_progress_margin').value)
         self.min_hit_clearance    = float(self.get_parameter('min_hit_clearance').value)
 
-        # Pose & Sensors
-        self.curr_x   = 0.0
-        self.curr_y   = 0.0
-        self.curr_yaw = 0.0
+        # ======================================================================
+        # BLOCK 3: Internal State & ROS Communications
+        # ======================================================================
+        self.curr_x     = 0.0
+        self.curr_y     = 0.0
+        self.curr_yaw   = 0.0
         self.odom_ready = False
 
         self.lidar_front       = float('inf')
@@ -101,7 +113,6 @@ class WallFollowServer(Node):
         self.create_subscription(LaserScan, f'/{ns}/scan', self._scan_cb, sensor_qos, callback_group=self.cb_group)
         self.create_subscription(LaserScan, '/scan', self._scan_cb, sensor_qos, callback_group=self.cb_group)
 
-        # Action Server
         self._action_server = ActionServer(
             self,
             Bug2WallFollow,
@@ -114,7 +125,11 @@ class WallFollowServer(Node):
 
         self.get_logger().info('Bug2WallFollow Action Server initialized.')
 
+    # ==========================================================================
+    # BLOCK 4: Sensor Callbacks & LiDAR 3-Sector Extraction
+    # ==========================================================================
     def _odom_cb(self, msg: Odometry):
+        """Update robot pose from odometry."""
         pos = msg.pose.pose.position
         self.curr_x   = pos.x
         self.curr_y   = pos.y
@@ -122,6 +137,7 @@ class WallFollowServer(Node):
         self.odom_ready = True
 
     def _scan_cb(self, msg: LaserScan):
+        """Extract minimum range for Front, Front-Right, and Right sensing sectors."""
         n = len(msg.ranges)
         if n == 0:
             return
@@ -151,19 +167,37 @@ class WallFollowServer(Node):
         self.lidar_right       = r_min
         self.scan_ready        = True
 
+    # ==========================================================================
+    # BLOCK 5: Motion Primitives & Action Lifecycle Handlers
+    # ==========================================================================
+    def _publish(self, linear: float, angular: float):
+        """Publish velocity command."""
+        t = Twist()
+        t.linear.x  = float(linear)
+        t.angular.z = float(angular)
+        self.cmd_pub.publish(t)
+
     def _stop(self):
+        """Send zero velocity to stop motors."""
         self.cmd_pub.publish(Twist())
 
     def goal_callback(self, goal_request):
+        """Accept incoming wall follow goal."""
         self.get_logger().info('Received WallFollow goal request.')
         return GoalResponse.ACCEPT
 
     def cancel_callback(self, goal_handle):
+        """Handle goal cancellation gracefully."""
         self.get_logger().info('WallFollow execution canceled by client.')
         self._stop()
         return CancelResponse.ACCEPT
 
+    # ==========================================================================
+    # BLOCK 6: Goal Execution Routine & 4-State Wall-Following Control
+    # ==========================================================================
     def execute_callback(self, goal_handle):
+        """Main action execution routine: tracks wall and evaluates Bug2 leave conditions."""
+        # Step 6.1: Extract points and compute M-line equation (A*x + B*y + C = 0)
         sx = goal_handle.request.start_point.x
         sy = goal_handle.request.start_point.y
         gx = goal_handle.request.target_point.x
@@ -171,7 +205,6 @@ class WallFollowServer(Node):
         hx = goal_handle.request.hit_point.x
         hy = goal_handle.request.hit_point.y
 
-        # M-line equation: A*x + B*y + C = 0
         dx = gx - sx
         dy = gy - sy
         ml_len = math.hypot(dx, dy)
@@ -191,6 +224,7 @@ class WallFollowServer(Node):
         self.get_logger().info(f'Starting WallFollow along M-line. Hit dist={hit_dist_to_goal:.2f}m')
         step_count = 0
 
+        # Step 6.2: Closed-loop control cycle (10 Hz)
         while rclpy.ok():
             if goal_handle.is_cancel_requested:
                 goal_handle.canceled()
@@ -269,13 +303,10 @@ class WallFollowServer(Node):
         result.message = 'Server shutdown'
         return result
 
-    def _publish(self, linear: float, angular: float):
-        t = Twist()
-        t.linear.x  = float(linear)
-        t.angular.z = float(angular)
-        self.cmd_pub.publish(t)
 
-
+# ==============================================================================
+# BLOCK 7: Node Entrypoint & Multi-Threaded Execution
+# ==============================================================================
 def main(args=None):
     rclpy.init(args=args)
     server = WallFollowServer()
@@ -294,4 +325,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-

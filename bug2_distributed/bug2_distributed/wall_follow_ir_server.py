@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-WallFollow IR Action Server (Adapter Node) for iRobot Create 3 - ROS 2 Jazzy
+WallFollow IR Action Server (Adapter Pattern) for iRobot Create 3 - ROS 2 Jazzy
 ================================================================================
 Node: wall_follow_ir_server
 Exposes Action Server : /wall_follow (create3_interfaces/action/Bug2WallFollow)
 Calls Action Client   : /{ns}/wall_follow (irobot_create_msgs/action/WallFollow)
 
 Architecture & Role in Bug2:
-- Acts as a bridge/adapter between Bug2 Coordinator and Create 3's built-in
-  IR-based WallFollow action server.
-- Receives start_point, target_point, and hit_point from Bug2 Coordinator.
-- Calls Create 3's internal wall_follow action to track the wall using native IR sensors.
-- Continuously monitors Odometry to track progress relative to the M-line.
-- When a valid Bug2 leave point (or goal) is reached, cancels the internal
-  Create 3 WallFollow action and returns success to Bug2 Coordinator.
+- Acts as a bridge/adapter between the Bug2 Coordinator and Create 3's built-in
+  firmware IR WallFollow action.
+- Translates Bug2WallFollow goal into native iRobot WallFollow requests.
+- Concurrently monitors odometry to evaluate the continuous M-line equation.
+- When a valid Bug2 leave point is detected, sends an asynchronous preemption
+  request to the firmware action and halts the robot.
 ================================================================================
 """
 
+# ==============================================================================
+# BLOCK 1: Imports & Mathematical Helper Functions
+# ==============================================================================
 import math
 import time
 import rclpy
@@ -36,11 +38,15 @@ from irobot_create_msgs.action import WallFollow
 
 
 def _yaw_from_quaternion(q):
+    """Extract yaw angle (rotation around Z axis) from ROS orientation quaternion."""
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny_cosp, cosy_cosp)
 
 
+# ==============================================================================
+# BLOCK 2: Node Class Definition & Parameter Declaration
+# ==============================================================================
 class WallFollowIRServer(Node):
     def __init__(self):
         super().__init__('wall_follow_ir_server')
@@ -60,7 +66,9 @@ class WallFollowIRServer(Node):
         self.min_hit_clearance = float(self.get_parameter('min_hit_clearance').value)
         self.max_runtime_sec   = int(self.get_parameter('max_runtime_sec').value)
 
-        # Pose cache
+        # ======================================================================
+        # BLOCK 3: Internal State & Dual ROS Communications
+        # ======================================================================
         self.curr_x     = 0.0
         self.curr_y     = 0.0
         self.curr_yaw   = 0.0
@@ -96,28 +104,42 @@ class WallFollowIRServer(Node):
         self.get_logger().info(f'  Targeting namespace: {ns}')
         self.get_logger().info('=' * 65)
 
+    # ==========================================================================
+    # BLOCK 4: Sensor Callbacks & State Tracking
+    # ==========================================================================
     def _odom_cb(self, msg: Odometry):
+        """Update robot pose from odometry."""
         pos = msg.pose.pose.position
         self.curr_x   = pos.x
         self.curr_y   = pos.y
         self.curr_yaw = _yaw_from_quaternion(msg.pose.pose.orientation)
         self.odom_ready = True
 
+    # ==========================================================================
+    # BLOCK 5: Preemption, Emergency Braking & Action Handlers
+    # ==========================================================================
     def _stop(self):
+        """Send zero velocity to stop motors."""
         t = Twist()
         for _ in range(3):
             self.cmd_pub.publish(t)
             time.sleep(0.02)
 
     def goal_callback(self, goal_request):
+        """Accept incoming Bug2 wall follow request."""
         self.get_logger().info('Received Bug2WallFollow goal request for IR-based following.')
         return GoalResponse.ACCEPT
 
     def cancel_callback(self, goal_handle):
+        """Handle coordinator-level action cancellation."""
         self.get_logger().info('Bug2WallFollow IR execution canceled by coordinator.')
         return CancelResponse.ACCEPT
 
+    # ==========================================================================
+    # BLOCK 6: Goal Execution Routine & M-Line Monitoring Loop
+    # ==========================================================================
     def execute_callback(self, goal_handle):
+        """Adapter execution: delegates to native firmware and monitors Bug2 leave point."""
         # 1. Wait for odometry
         while not self.odom_ready and rclpy.ok():
             if goal_handle.is_cancel_requested:
@@ -277,6 +299,9 @@ class WallFollowIRServer(Node):
         return result
 
 
+# ==============================================================================
+# BLOCK 7: Node Entrypoint & Multi-Threaded Execution
+# ==============================================================================
 def main(args=None):
     rclpy.init(args=args)
     server = WallFollowIRServer()
@@ -295,4 +320,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-

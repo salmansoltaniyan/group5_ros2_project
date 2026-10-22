@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-Bug2 Coordinator (Brain Node) for iRobot Create 3 - ROS 2 Jazzy
+Bug2 Coordinator (Brain & State Machine) for iRobot Create 3 - ROS 2 Jazzy
 ================================================================================
 Node: bug2_coordinator
 Clients:
   - /go_to_goal   (GoToGoal Action Client)
   - /wall_follow  (Bug2WallFollow Action Client)
 
-Architecture:
-- Acts as the central state machine / orchestrator for Bug2 navigation.
-- Receives user inputs (goal_x, goal_y) relative to the robot's initial pose.
+Architecture & Role:
+- Acts as the central supervisor / state machine for the distributed Bug2 architecture.
+- Receives user inputs (goal_x, goal_y) relative to the initial robot heading.
 - Computes global world frame Start and Goal coordinates.
-- Switches seamlessly between GoToGoal and WallFollow actions until Goal is reached.
+- Seamlessly orchestrates cycles between GoToGoal and WallFollow actions until
+  the global destination is reached.
 ================================================================================
 """
 
+# ==============================================================================
+# BLOCK 1: Imports & Mathematical Helper Functions
+# ==============================================================================
 import math
 import time
 import threading
@@ -33,11 +37,15 @@ from create3_interfaces.action import GoToGoal, Bug2WallFollow
 
 
 def _yaw_from_quaternion(q):
+    """Extract yaw angle (rotation around Z axis) from ROS orientation quaternion."""
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny_cosp, cosy_cosp)
 
 
+# ==============================================================================
+# BLOCK 2: Node Class Definition & Parameter Declaration
+# ==============================================================================
 class Bug2Coordinator(Node):
     def __init__(self):
         super().__init__('bug2_coordinator')
@@ -51,7 +59,10 @@ class Bug2Coordinator(Node):
         self.goal_dx = float(self.get_parameter('goal_x').value)
         self.goal_dy = float(self.get_parameter('goal_y').value)
 
-        # Action Clients
+        # ======================================================================
+        # BLOCK 3: Action Clients, Coordinate Storage & Threading
+        # ======================================================================
+        # Action clients communicating with dedicated action servers
         self.goto_client = ActionClient(self, GoToGoal, 'go_to_goal')
         self.wall_client = ActionClient(self, Bug2WallFollow, 'wall_follow')
 
@@ -78,12 +89,16 @@ class Bug2Coordinator(Node):
         self.get_logger().info('  Waiting for Odometry and Action Servers...')
         self.get_logger().info('=' * 65)
 
-        # Run coordination in a dedicated background thread
+        # Run coordination in a dedicated background worker thread
         self.coord_thread = threading.Thread(target=self._run_coordinator)
         self.coord_thread.daemon = True
         self.coord_thread.start()
 
+    # ==========================================================================
+    # BLOCK 4: Odometry Callback & Coordinate Transformation
+    # ==========================================================================
     def _odom_cb(self, msg: Odometry):
+        """Update current position and register initial start pose."""
         pos = msg.pose.pose.position
         self.curr_x   = pos.x
         self.curr_y   = pos.y
@@ -94,6 +109,7 @@ class Bug2Coordinator(Node):
             self._record_start()
 
     def _record_start(self):
+        """Record start position and rotate relative target offset into world coordinates."""
         self.start_x = self.curr_x
         self.start_y = self.curr_y
         self.start_yaw = self.curr_yaw
@@ -112,14 +128,22 @@ class Bug2Coordinator(Node):
         self.get_logger().info(f'  Start Pos: ({self.start_x:.3f}, {self.start_y:.3f}) | Yaw: {math.degrees(self.start_yaw):.1f}°')
         self.get_logger().info(f'  Goal  Pos: ({self.goal_x:.3f}, {self.goal_y:.3f})')
 
+    # ==========================================================================
+    # BLOCK 5: Thread-Safe Future Resolution Helper
+    # ==========================================================================
     def _wait_for_future(self, future):
+        """Poll future completion non-blockingly while executor spins on the main thread."""
         while rclpy.ok() and not future.done():
             time.sleep(0.05)
         if not rclpy.ok() or not future.done():
             return None
         return future.result()
 
+    # ==========================================================================
+    # BLOCK 6: Bug2 Finite State Machine Orchestrator Loop
+    # ==========================================================================
     def _run_coordinator(self):
+        """Worker thread executing the supervisory Bug2 state machine."""
         # 1. Wait for Start & Servers
         while rclpy.ok() and not self.start_recorded:
             time.sleep(0.1)
@@ -201,6 +225,9 @@ class Bug2Coordinator(Node):
                 break
 
 
+# ==============================================================================
+# BLOCK 7: Node Entrypoint & Multi-Threaded Execution
+# ==============================================================================
 def main(args=None):
     rclpy.init(args=args)
     coordinator = Bug2Coordinator()
@@ -217,4 +244,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-

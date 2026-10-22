@@ -7,8 +7,8 @@ Node: go_to_goal_server
 Action: /go_to_goal (create3_interfaces/action/GoToGoal)
 
 Role in Bug2 Architecture:
-- Directs the robot straight towards the goal coordinate.
-- Subscribes to Odometry for current pose and LiDAR for front obstacle checks.
+- Directs the robot along a straight trajectory toward the target coordinate.
+- Subscribes to Odometry for pose tracking and LiDAR for front obstacle checks.
 - If goal is reached (distance < goal_tolerance):
     Returns result.reached_goal = True.
 - If an obstacle is detected in front:
@@ -16,6 +16,9 @@ Role in Bug2 Architecture:
 ================================================================================
 """
 
+# ==============================================================================
+# BLOCK 1: Imports & Mathematical Helper Functions
+# ==============================================================================
 import math
 import time
 import rclpy
@@ -34,12 +37,14 @@ from create3_interfaces.action import GoToGoal
 
 
 def _yaw_from_quaternion(q):
+    """Extract yaw angle (rotation around Z axis) from ROS orientation quaternion."""
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny_cosp, cosy_cosp)
 
 
 def _angle_diff(a, b):
+    """Compute the shortest angular difference (a - b) normalized to [-pi, +pi]."""
     d = a - b
     while d > math.pi:
         d -= 2.0 * math.pi
@@ -48,6 +53,9 @@ def _angle_diff(a, b):
     return d
 
 
+# ==============================================================================
+# BLOCK 2: Node Class Definition & Parameter Declaration
+# ==============================================================================
 class GoToGoalServer(Node):
     def __init__(self):
         super().__init__('go_to_goal_server')
@@ -67,7 +75,9 @@ class GoToGoalServer(Node):
         self.front_dist_thr = float(self.get_parameter('front_dist_threshold').value)
         self.corner_dist_thr= float(self.get_parameter('corner_dist_threshold').value)
 
-        # Pose & Sensor Cache
+        # ======================================================================
+        # BLOCK 3: Internal State & ROS Communications
+        # ======================================================================
         self.curr_x   = 0.0
         self.curr_y   = 0.0
         self.curr_yaw = 0.0
@@ -85,7 +95,6 @@ class GoToGoalServer(Node):
         self.create_subscription(LaserScan, f'/{ns}/scan', self._scan_cb, sensor_qos, callback_group=self.cb_group)
         self.create_subscription(LaserScan, '/scan', self._scan_cb, sensor_qos, callback_group=self.cb_group)
 
-        # Action Server
         self._action_server = ActionServer(
             self,
             GoToGoal,
@@ -98,7 +107,11 @@ class GoToGoalServer(Node):
 
         self.get_logger().info('GoToGoal Action Server initialized.')
 
+    # ==========================================================================
+    # BLOCK 4: Sensor Callbacks & LiDAR Sector Parsing
+    # ==========================================================================
     def _odom_cb(self, msg: Odometry):
+        """Update robot position and heading from odometry."""
         pos = msg.pose.pose.position
         self.curr_x   = pos.x
         self.curr_y   = pos.y
@@ -106,6 +119,7 @@ class GoToGoalServer(Node):
         self.odom_ready = True
 
     def _scan_cb(self, msg: LaserScan):
+        """Parse raw LaserScan rays into Front [-20°, +20°] and Front-Right [-50°, -20°] sectors."""
         n = len(msg.ranges)
         if n == 0:
             return
@@ -132,19 +146,29 @@ class GoToGoalServer(Node):
         self.lidar_front_right = fr_min
         self.scan_ready        = True
 
+    # ==========================================================================
+    # BLOCK 5: Motion Primitives & Action Lifecycle Handlers
+    # ==========================================================================
     def _stop(self):
+        """Send zero velocity to stop motors."""
         self.cmd_pub.publish(Twist())
 
     def goal_callback(self, goal_request):
+        """Accept incoming goal requests and log coordinates."""
         self.get_logger().info(f'Received GoToGoal target: ({goal_request.target_point.x:.2f}, {goal_request.target_point.y:.2f})')
         return GoalResponse.ACCEPT
 
     def cancel_callback(self, goal_handle):
+        """Handle goal cancellation requests gracefully."""
         self.get_logger().info('GoToGoal execution canceled by client.')
         self._stop()
         return CancelResponse.ACCEPT
 
+    # ==========================================================================
+    # BLOCK 6: Goal Execution Routine & Closed-Loop Steering
+    # ==========================================================================
     def execute_callback(self, goal_handle):
+        """Main action execution loop directing robot toward target until arrival or obstacle hit."""
         target_x = goal_handle.request.target_point.x
         target_y = goal_handle.request.target_point.y
 
@@ -153,7 +177,7 @@ class GoToGoalServer(Node):
 
         rate = self.create_rate(10.0)
 
-        # Wait until odometry is available
+        # Step 6.1: Wait until initial odometry is received
         while not self.odom_ready:
             if goal_handle.is_cancel_requested:
                 goal_handle.canceled()
@@ -165,6 +189,7 @@ class GoToGoalServer(Node):
         self.get_logger().info(f'Navigating towards goal ({target_x:.2f}, {target_y:.2f})...')
         step_count = 0
 
+        # Step 6.2: 10 Hz Closed-loop navigation loop
         while rclpy.ok():
             if goal_handle.is_cancel_requested:
                 goal_handle.canceled()
@@ -172,11 +197,12 @@ class GoToGoalServer(Node):
                 result.message = 'Canceled'
                 return result
 
+            # Compute remaining distance and stream feedback
             dist = math.hypot(target_x - self.curr_x, target_y - self.curr_y)
             feedback_msg.distance_to_target = float(dist)
             goal_handle.publish_feedback(feedback_msg)
 
-            # Telemetry every 1.0 second (10 * 0.1s)
+            # Telemetry logging every 1.0 second
             step_count += 1
             if step_count % 10 == 0:
                 self.get_logger().info(
@@ -185,7 +211,7 @@ class GoToGoalServer(Node):
                     f'FrontRight: {self.lidar_front_right:.2f}m'
                 )
 
-            # 1. Goal Reached Check
+            # Condition 1: Target reached
             if dist < self.goal_tolerance:
                 self._stop()
                 result.reached_goal = True
@@ -195,11 +221,11 @@ class GoToGoalServer(Node):
                 self.get_logger().info('★ GOAL REACHED! ★')
                 return result
 
-            # 2. Heading alignment and Obstacle Check
+            # Heading error calculation
             angle_to_goal = math.atan2(target_y - self.curr_y, target_x - self.curr_x)
             err = _angle_diff(angle_to_goal, self.curr_yaw)
 
-            # Check obstacle when reasonably facing goal direction
+            # Condition 2: Obstacle detected along forward heading
             if abs(err) <= 0.60:
                 is_front = (self.lidar_front <= self.front_dist_thr)
                 is_corner = (self.lidar_front_right <= self.corner_dist_thr)
@@ -222,7 +248,7 @@ class GoToGoalServer(Node):
                     )
                     return result
 
-            # Motion control
+            # Step 6.3: Motion control - rotate in place if heading error is large, else cruise forward
             t = Twist()
             if abs(err) > 0.30:
                 t.linear.x  = 0.0
@@ -239,6 +265,9 @@ class GoToGoalServer(Node):
         return result
 
 
+# ==============================================================================
+# BLOCK 7: Node Entrypoint & Multi-Threaded Execution
+# ==============================================================================
 def main(args=None):
     rclpy.init(args=args)
     server = GoToGoalServer()
@@ -257,4 +286,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
