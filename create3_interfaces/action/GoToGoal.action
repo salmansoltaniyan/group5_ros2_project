@@ -1,0 +1,14 @@
+# Goal
+geometry_msgs/Point target_point
+
+---
+# Result
+bool reached_goal
+bool obstacle_detected
+geometry_msgs/Point hit_point
+string message
+
+---
+# Feedback
+float64 distance_to_target
+

@@ -11,6 +11,7 @@ find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/Bug2WallFollow.action"
+  "action/GoToGoal.action"
   DEPENDENCIES geometry_msgs
 )
 
