@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'go_to_goal_server = bug2_distributed.go_to_goal_server:main',
             'wall_follow_server = bug2_distributed.wall_follow_server:main',
+            'wall_follow_ir_server = bug2_distributed.wall_follow_ir_server:main',
             'bug2_coordinator = bug2_distributed.bug2_coordinator:main',
         ],
     },
