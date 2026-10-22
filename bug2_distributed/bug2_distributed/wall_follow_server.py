@@ -236,53 +236,33 @@ class WallFollowServer(Node):
                 on_m_line  = (d_m_line <= self.m_line_tol)
                 progressed = (d_goal <= (hit_dist_to_goal - self.leave_margin))
 
-                angle_to_goal = math.atan2(gy - self.curr_y, gx - self.curr_x)
-                heading_err = abs(_angle_diff(angle_to_goal, self.curr_yaw))
-                path_open = (self.lidar_front > 0.45) or (heading_err > 1.2)
-
-                if on_m_line and progressed and path_open:
+                if on_m_line and progressed:
                     self._stop()
                     result.success = True
                     result.message = f'Valid Bug2 leave point reached at ({self.curr_x:.2f}, {self.curr_y:.2f})!'
                     goal_handle.succeed()
-                    self.get_logger().info(f'[LEAVE] Reached M-line leave point at ({self.curr_x:.2f}, {self.curr_y:.2f})!')
+                    self.get_logger().info(f'[LEAVE] Reached M-line leave point at ({self.curr_x:.2f}, {self.curr_y:.2f})! (M-dist={d_m_line:.2f}m, GoalDist={d_goal:.2f}m)')
                     return result
 
-            # 4. Motion Control: Stop-at-Corner + PD on Straights
-            # RULE 1: Inner corner / dead-end ahead
-            if self.lidar_front < self.front_dist_thr or self.lidar_front_right < self.corner_dist_thr:
+            # 4. Motion Control: Proven 4-State Wall-Following Logic
+            front_too_close = (self.lidar_front < 0.28 or self.lidar_front_right < 0.28)
+
+            if front_too_close:
+                # 1. Obstacle ahead (Inner Corner / Dead-end): Turn left in-place
                 self._publish(0.0, self.angular_speed)
-                prev_wall_error = 0.0
-                prev_error_time = None
-                time.sleep(0.10)
-                continue
 
-            # RULE 2: Outer corner (wall ended on right)
-            if self.lidar_right > self.side_dist_thr:
-                self._publish(0.0, -self.angular_speed)
-                prev_wall_error = 0.0
-                prev_error_time = None
-                time.sleep(0.10)
-                continue
+            elif self.lidar_right < 0.18:
+                # 2. Too close to right wall: Creep forward and steer gently LEFT
+                self._publish(self.wall_speed, 0.25)
 
-            # RULE 3: Straight wall driving with continuous PD
-            error = self.lidar_right - self.desired_wall_dist
-            now_time = self.get_clock().now().nanoseconds / 1e9
+            elif self.lidar_right > 0.26:
+                # 3. Too far from right wall (or Outer Corner): Steer gently RIGHT while driving forward!
+                self._publish(self.wall_speed * 0.8, -0.35)
 
-            if prev_error_time is not None and (now_time - prev_error_time) > 1e-4:
-                dt = now_time - prev_error_time
-                d_error = (error - prev_wall_error) / dt
             else:
-                d_error = 0.0
+                # 4. In sweet spot (~21cm LiDAR, ~5cm body): Drive straight!
+                self._publish(self.wall_speed, 0.0)
 
-            prev_wall_error = error
-            prev_error_time = now_time
-
-            u_ang = - (self.kp_wall * error + self.kd_wall * d_error)
-            max_ang = 0.40
-            u_ang = max(-max_ang, min(max_ang, u_ang))
-
-            self._publish(self.wall_speed, u_ang)
             time.sleep(0.10)
 
         result.success = False
