@@ -22,6 +22,7 @@ import threading
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from geometry_msgs.msg import Point
@@ -111,6 +112,13 @@ class Bug2Coordinator(Node):
         self.get_logger().info(f'  Start Pos: ({self.start_x:.3f}, {self.start_y:.3f}) | Yaw: {math.degrees(self.start_yaw):.1f}°')
         self.get_logger().info(f'  Goal  Pos: ({self.goal_x:.3f}, {self.goal_y:.3f})')
 
+    def _wait_for_future(self, future):
+        while rclpy.ok() and not future.done():
+            time.sleep(0.05)
+        if not rclpy.ok() or not future.done():
+            return None
+        return future.result()
+
     def _run_coordinator(self):
         # 1. Wait for Start & Servers
         while rclpy.ok() and not self.start_recorded:
@@ -136,16 +144,17 @@ class Bug2Coordinator(Node):
             goto_goal.target_point = Point(x=self.goal_x, y=self.goal_y, z=0.0)
 
             send_goal_future = self.goto_client.send_goal_async(goto_goal)
-            rclpy.spin_until_future_complete(self, send_goal_future)
-            goal_handle = send_goal_future.result()
+            goal_handle = self._wait_for_future(send_goal_future)
 
-            if not goal_handle.accepted:
+            if goal_handle is None or not goal_handle.accepted:
                 self.get_logger().error('GoToGoal goal was rejected by server!')
                 break
 
             result_future = goal_handle.get_result_async()
-            rclpy.spin_until_future_complete(self, result_future)
-            result = result_future.result().result
+            result_wrap = self._wait_for_future(result_future)
+            if result_wrap is None:
+                break
+            result = result_wrap.result
 
             if result.reached_goal:
                 self.get_logger().info('=' * 65)
@@ -172,16 +181,17 @@ class Bug2Coordinator(Node):
             wf_goal.follow_side  = -1  # Right side
 
             wf_future = self.wall_client.send_goal_async(wf_goal)
-            rclpy.spin_until_future_complete(self, wf_future)
-            wf_handle = wf_future.result()
+            wf_handle = self._wait_for_future(wf_future)
 
-            if not wf_handle.accepted:
+            if wf_handle is None or not wf_handle.accepted:
                 self.get_logger().error('WallFollow goal was rejected by server!')
                 break
 
             wf_result_future = wf_handle.get_result_async()
-            rclpy.spin_until_future_complete(self, wf_result_future)
-            wf_result = wf_result_future.result().result
+            wf_result_wrap = self._wait_for_future(wf_result_future)
+            if wf_result_wrap is None:
+                break
+            wf_result = wf_result_wrap.result
 
             if wf_result.success:
                 self.get_logger().info(f'[WALL FOLLOW COMPLETE] {wf_result.message}')
@@ -194,8 +204,10 @@ class Bug2Coordinator(Node):
 def main(args=None):
     rclpy.init(args=args)
     coordinator = Bug2Coordinator()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(coordinator)
     try:
-        rclpy.spin(coordinator)
+        executor.spin()
     except KeyboardInterrupt:
         coordinator.get_logger().info('Shutting down Bug2 Coordinator...')
     finally:

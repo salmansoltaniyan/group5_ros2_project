@@ -189,6 +189,7 @@ class WallFollowServer(Node):
         result       = Bug2WallFollow.Result()
 
         self.get_logger().info(f'Starting WallFollow along M-line. Hit dist={hit_dist_to_goal:.2f}m')
+        step_count = 0
 
         while rclpy.ok():
             if goal_handle.is_cancel_requested:
@@ -206,6 +207,15 @@ class WallFollowServer(Node):
             feedback_msg.distance_to_target = float(d_goal)
             feedback_msg.distance_to_m_line = float(d_m_line)
             goal_handle.publish_feedback(feedback_msg)
+
+            # Telemetry every 1.0s (10 * 0.1s)
+            step_count += 1
+            if step_count % 10 == 0:
+                self.get_logger().info(
+                    f'[WALL] Pos: ({self.curr_x:.2f}, {self.curr_y:.2f}) | '
+                    f'F: {self.lidar_front:.2f}m | FR: {self.lidar_front_right:.2f}m | '
+                    f'R: {self.lidar_right:.2f}m | M-dist: {d_m_line:.2f}m | GoalDist: {d_goal:.2f}m'
+                )
 
             # 1. Direct Goal Arrival Check
             if d_goal < self.goal_tolerance:
