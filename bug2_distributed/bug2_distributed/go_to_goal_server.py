@@ -85,6 +85,7 @@ class GoToGoalServer(Node):
 
         self.lidar_front       = float('inf')
         self.lidar_front_right = float('inf')
+        self.lidar_front_left  = float('inf')
         self.scan_ready        = False
 
         self.cb_group = ReentrantCallbackGroup()
@@ -124,7 +125,7 @@ class GoToGoalServer(Node):
         if n == 0:
             return
 
-        f_min = fr_min = float('inf')
+        f_min = fr_min = fl_min = float('inf')
         for i in range(n):
             r = msg.ranges[i]
             if not (msg.range_min <= r <= msg.range_max and math.isfinite(r)):
@@ -141,9 +142,12 @@ class GoToGoalServer(Node):
                 f_min = min(f_min, r)
             elif -50.0 <= angle_deg < -20.0:
                 fr_min = min(fr_min, r)
+            elif 20.0 < angle_deg <= 50.0:
+                fl_min = min(fl_min, r)
 
         self.lidar_front       = f_min
         self.lidar_front_right = fr_min
+        self.lidar_front_left  = fl_min
         self.scan_ready        = True
 
     # ==========================================================================
@@ -228,13 +232,15 @@ class GoToGoalServer(Node):
             # Condition 2: Obstacle detected along forward heading
             if abs(err) <= 0.60:
                 is_front = (self.lidar_front <= self.front_dist_thr)
-                is_corner = (self.lidar_front_right <= self.corner_dist_thr)
+                is_corner = (self.lidar_front_right <= self.corner_dist_thr or self.lidar_front_left <= self.corner_dist_thr)
                 if is_front or is_corner:
                     reasons = []
                     if is_front:
                         reasons.append(f'Front {self.lidar_front:.2f}m <= {self.front_dist_thr:.2f}m')
-                    if is_corner:
+                    if self.lidar_front_right <= self.corner_dist_thr:
                         reasons.append(f'FrontRight {self.lidar_front_right:.2f}m <= {self.corner_dist_thr:.2f}m')
+                    if self.lidar_front_left <= self.corner_dist_thr:
+                        reasons.append(f'FrontLeft {self.lidar_front_left:.2f}m <= {self.corner_dist_thr:.2f}m')
                     trigger_msg = ', '.join(reasons)
 
                     self._stop()

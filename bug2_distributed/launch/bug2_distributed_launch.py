@@ -34,15 +34,18 @@ def generate_launch_description():
         DeclareLaunchArgument('wall_follow_type', default_value='lidar',
                               choices=['lidar', 'ir'],
                               description='Wall follow backend: "lidar" (2D LiDAR PD) or "ir" (Create 3 built-in IR)'),
+        DeclareLaunchArgument('follow_side',      default_value='left',
+                              choices=['left', 'right'],
+                              description='Wall to follow: "left" (left-hand rule) or "right" (right-hand rule)'),
         DeclareLaunchArgument('goal_x',           default_value='2.5',
                               description='Goal X offset from robot initial pose (meters)'),
         DeclareLaunchArgument('goal_y',           default_value='0.0',
                               description='Goal Y offset from robot initial pose (meters)'),
         DeclareLaunchArgument('linear_speed',     default_value='0.15',
                               description='Forward cruise speed (m/s)'),
-        DeclareLaunchArgument('wall_speed',       default_value='0.16',
+        DeclareLaunchArgument('wall_speed',       default_value='0.12',
                               description='Wall-following forward speed for LiDAR (m/s)'),
-        DeclareLaunchArgument('angular_speed',    default_value='0.70',
+        DeclareLaunchArgument('angular_speed',    default_value='0.50',
                               description='In-place rotation speed (rad/s)'),
     ]
 
@@ -121,9 +124,10 @@ def generate_launch_description():
         output='screen',
         emulate_tty=True,
         parameters=[{
-            'namespace': LaunchConfiguration('namespace'),
-            'goal_x':    LaunchConfiguration('goal_x'),
-            'goal_y':    LaunchConfiguration('goal_y'),
+            'namespace':   LaunchConfiguration('namespace'),
+            'follow_side': LaunchConfiguration('follow_side'),
+            'goal_x':      LaunchConfiguration('goal_x'),
+            'goal_y':      LaunchConfiguration('goal_y'),
         }]
     )
 

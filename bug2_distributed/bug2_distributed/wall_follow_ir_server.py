@@ -184,14 +184,15 @@ class WallFollowIRServer(Node):
 
         # 4. Send Goal to Create 3 Internal WallFollow
         c3_goal = WallFollow.Goal()
-        # follow_side: 1 = left, -1 = right (default to right for Bug2 if not specified)
-        c3_goal.follow_side = int(req.follow_side) if req.follow_side != 0 else -1
+        # follow_side: 1 = left wall, -1 = right wall
+        c3_goal.follow_side = int(req.follow_side) if req.follow_side != 0 else 1
         c3_goal.max_runtime.sec = int(self.max_runtime_sec)
         c3_goal.max_runtime.nanosec = 0
 
+        side_name = "LEFT" if c3_goal.follow_side == 1 else "RIGHT"
         self.get_logger().info(
-            f'[IR-WALL] Calling Create 3 internal WallFollow (follow_side={c3_goal.follow_side}, '
-            f'max_runtime={c3_goal.max_runtime.sec}s)...'
+            f'[IR-WALL] Starting Create 3 internal WallFollow (side={side_name}, '
+            f'follow_side={c3_goal.follow_side}, max_runtime={c3_goal.max_runtime.sec}s)...'
         )
         send_goal_future = self._c3_client.send_goal_async(c3_goal)
 

@@ -103,6 +103,8 @@ class WallFollowServer(Node):
         self.lidar_front       = float('inf')
         self.lidar_front_right = float('inf')
         self.lidar_right       = float('inf')
+        self.lidar_front_left  = float('inf')
+        self.lidar_left        = float('inf')
         self.scan_ready        = False
 
         self.cb_group = ReentrantCallbackGroup()
@@ -142,7 +144,7 @@ class WallFollowServer(Node):
         if n == 0:
             return
 
-        f_min = fr_min = r_min = float('inf')
+        f_min = fr_min = r_min = fl_min = l_min = float('inf')
         for i in range(n):
             r = msg.ranges[i]
             if not (msg.range_min <= r <= msg.range_max and math.isfinite(r)):
@@ -161,10 +163,16 @@ class WallFollowServer(Node):
                 fr_min = min(fr_min, r)
             elif -110.0 <= angle_deg < -70.0:
                 r_min = min(r_min, r)
+            elif 20.0 < angle_deg <= 50.0:
+                fl_min = min(fl_min, r)
+            elif 70.0 < angle_deg <= 110.0:
+                l_min = min(l_min, r)
 
         self.lidar_front       = f_min
         self.lidar_front_right = fr_min
         self.lidar_right       = r_min
+        self.lidar_front_left  = fl_min
+        self.lidar_left        = l_min
         self.scan_ready        = True
 
     # ==========================================================================
@@ -212,6 +220,11 @@ class WallFollowServer(Node):
         ml_b =  dx
         ml_c =  dy * sx - dx * sy
 
+        # Follow side: +1 = Left wall, -1 = Right wall (default)
+        follow_side = int(goal_handle.request.follow_side)
+        is_left = (follow_side == 1)
+        turn_dir = -1.0 if is_left else 1.0  # Invert steering & spinning direction for left wall
+
         hit_dist_to_goal = math.hypot(gx - hx, gy - hy)
         hit_clearance_ok = False
 
@@ -221,7 +234,7 @@ class WallFollowServer(Node):
         feedback_msg = Bug2WallFollow.Feedback()
         result       = Bug2WallFollow.Result()
 
-        self.get_logger().info(f'Starting WallFollow along M-line. Hit dist={hit_dist_to_goal:.2f}m')
+        self.get_logger().info(f'Starting WallFollow (side={"LEFT" if is_left else "RIGHT"}) along M-line. Hit dist={hit_dist_to_goal:.2f}m')
         step_count = 0
 
         # Step 6.2: Closed-loop control cycle (10 Hz)
@@ -232,6 +245,10 @@ class WallFollowServer(Node):
                 result.success = False
                 result.message = 'Canceled'
                 return result
+
+            # Select wall & corner sensing according to chosen side
+            d_wall   = self.lidar_left if is_left else self.lidar_right
+            d_corner = self.lidar_front_left if is_left else self.lidar_front_right
 
             d_goal = math.hypot(gx - self.curr_x, gy - self.curr_y)
             d_hit  = math.hypot(hx - self.curr_x, hy - self.curr_y)
@@ -245,10 +262,11 @@ class WallFollowServer(Node):
             # Telemetry every 1.0s (10 * 0.1s)
             step_count += 1
             if step_count % 10 == 0:
+                side_tag = "L" if is_left else "R"
                 self.get_logger().info(
-                    f'[WALL] Pos: ({self.curr_x:.2f}, {self.curr_y:.2f}) | '
-                    f'F: {self.lidar_front:.2f}m | FR: {self.lidar_front_right:.2f}m | '
-                    f'R: {self.lidar_right:.2f}m | M-dist: {d_m_line:.2f}m | GoalDist: {d_goal:.2f}m'
+                    f'[WALL-{side_tag}] Pos: ({self.curr_x:.2f}, {self.curr_y:.2f}) | '
+                    f'F: {self.lidar_front:.2f}m | Corner: {d_corner:.2f}m | '
+                    f'Wall: {d_wall:.2f}m | M-dist: {d_m_line:.2f}m | GoalDist: {d_goal:.2f}m'
                 )
 
             # 1. Direct Goal Arrival Check
@@ -278,23 +296,24 @@ class WallFollowServer(Node):
                     self.get_logger().info(f'[LEAVE] Reached M-line leave point at ({self.curr_x:.2f}, {self.curr_y:.2f})! (M-dist={d_m_line:.2f}m, GoalDist={d_goal:.2f}m)')
                     return result
 
-            # 4. Motion Control: Proven 4-State Wall-Following Logic
-            front_too_close = (self.lidar_front < 0.28 or self.lidar_front_right < 0.28)
+            # 4. Motion Control: Symmetrical 4-State Wall-Following Logic
+            front_too_close = (self.lidar_front < 0.28 or d_corner < 0.28)
 
             if front_too_close:
-                # 1. Obstacle ahead (Inner Corner / Dead-end): Turn left in-place
-                self._publish(0.0, self.angular_speed)
+                # State 1: Inner Corner / Dead-end: Turn in place away from wall
+                # (Right wall -> turn left CCW (+); Left wall -> turn right CW (-))
+                self._publish(0.0, turn_dir * self.angular_speed)
 
-            elif self.lidar_right < 0.18:
-                # 2. Too close to right wall: Creep forward and steer gently LEFT
-                self._publish(self.wall_speed, 0.25)
+            elif d_wall < 0.18:
+                # State 2: Too close to wall: Creep forward and steer away from wall
+                self._publish(self.wall_speed, turn_dir * 0.25)
 
-            elif self.lidar_right > 0.26:
-                # 3. Too far from right wall (or Outer Corner): Steer gently RIGHT while driving forward!
-                self._publish(self.wall_speed * 0.8, -0.35)
+            elif d_wall > 0.26:
+                # State 3: Outer Corner / Wall Ended: Steer into corner while driving forward
+                self._publish(self.wall_speed * 0.8, -turn_dir * 0.35)
 
             else:
-                # 4. In sweet spot (~21cm LiDAR, ~5cm body): Drive straight!
+                # State 4: In sweet spot (~21cm LiDAR, ~5cm body): Drive straight!
                 self._publish(self.wall_speed, 0.0)
 
             time.sleep(0.10)

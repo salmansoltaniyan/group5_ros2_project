@@ -51,13 +51,17 @@ class Bug2Coordinator(Node):
         super().__init__('bug2_coordinator')
 
         flex = ParameterDescriptor(dynamic_typing=True)
-        self.declare_parameter('namespace',  'robot_9')
-        self.declare_parameter('goal_x',     2.0, flex)
-        self.declare_parameter('goal_y',     0.0, flex)
+        self.declare_parameter('namespace',   'robot_9')
+        self.declare_parameter('follow_side', 'left', flex)
+        self.declare_parameter('goal_x',      2.0,    flex)
+        self.declare_parameter('goal_y',      0.0,    flex)
 
         ns = str(self.get_parameter('namespace').value)
         self.goal_dx = float(self.get_parameter('goal_x').value)
         self.goal_dy = float(self.get_parameter('goal_y').value)
+
+        side_param = str(self.get_parameter('follow_side').value).strip().lower()
+        self.follow_side = 1 if side_param in ['1', 'left'] else -1
 
         # ======================================================================
         # BLOCK 3: Action Clients, Coordinate Storage & Threading
@@ -85,7 +89,7 @@ class Bug2Coordinator(Node):
 
         self.get_logger().info('=' * 65)
         self.get_logger().info('  Bug2 Distributed Coordinator Initialized')
-        self.get_logger().info(f'  Target offset: dx={self.goal_dx:.2f}m, dy={self.goal_dy:.2f}m')
+        self.get_logger().info(f'  Target offset: dx={self.goal_dx:.2f}m, dy={self.goal_dy:.2f}m | Follow Side: {"LEFT" if self.follow_side == 1 else "RIGHT"}')
         self.get_logger().info('  Waiting for Odometry and Action Servers...')
         self.get_logger().info('=' * 65)
 
@@ -202,7 +206,7 @@ class Bug2Coordinator(Node):
             wf_goal.start_point  = Point(x=self.start_x, y=self.start_y, z=0.0)
             wf_goal.target_point = Point(x=self.goal_x,  y=self.goal_y,  z=0.0)
             wf_goal.hit_point    = Point(x=hit_x,        y=hit_y,        z=0.0)
-            wf_goal.follow_side  = -1  # Right side
+            wf_goal.follow_side  = int(self.follow_side)
 
             wf_future = self.wall_client.send_goal_async(wf_goal)
             wf_handle = self._wait_for_future(wf_future)
