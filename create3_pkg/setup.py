@@ -24,7 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'wall_following = create3_pkg.wall_following:main'
+            'wall_following = create3_pkg.wall_following:main',
+            'lidar_logger = create3_pkg.lidar_logger:main',
         ],
     },
 )
