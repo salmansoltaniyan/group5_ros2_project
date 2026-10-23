@@ -40,7 +40,7 @@ def generate_launch_description():
                               description='Goal Y offset from robot initial pose (meters)'),
         DeclareLaunchArgument('linear_speed',     default_value='0.15',
                               description='Forward cruise speed (m/s)'),
-        DeclareLaunchArgument('wall_speed',       default_value='0.12',
+        DeclareLaunchArgument('wall_speed',       default_value='0.46',
                               description='Wall-following forward speed for LiDAR (m/s)'),
         DeclareLaunchArgument('angular_speed',    default_value='0.50',
                               description='In-place rotation speed (rad/s)'),
